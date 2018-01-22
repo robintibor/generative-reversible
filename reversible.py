@@ -116,43 +116,41 @@ def plot_xyz(x, y, z):
               interpolation='nearest')
 
 
-def greedy_unique_diffs(diffs):
-    finished = False
-    n_iterations = 1
+def greedy_unique_diff_matrix(diffs, n_iterations):
     iteration = 0
-    while not finished:
-        finished = True
-        # assume clusters is in dim 1
-        # so var x clusers
-        mins, min_var_inds = th.min(diffs, dim=0)
-        min_var_to_cluster = dict()
-        for cluster, min_var in enumerate(min_var_inds):
-            min_var = min_var.data.cpu().numpy()[0]
-            if min_var not in min_var_to_cluster:
-                min_var_to_cluster[min_var] = []
-            min_var_to_cluster[min_var].append(cluster)
-
-        min_vars = list(min_var_to_cluster.keys())
-        for min_var in min_vars:
-            clusters = min_var_to_cluster[min_var]
-            if len(clusters) > 1:
-                _, min_cluster = th.min(mins[th.from_numpy(np.array(clusters))],
-                                        dim=0)
-                min_cluster = clusters[min_cluster.data.cpu().numpy().squeeze()]
-                finished = False
-            else:
-                min_cluster = clusters[0]
-            min_diff = diffs[min_var, min_cluster].clone()
-            diffs[:, min_cluster] = 100000
-            diffs[min_var, :] = 100000
-            diffs[min_var, min_cluster] = min_diff
-        iteration += 1
-        if iteration >= n_iterations:
+    n_elements = 0
+    finished_completely = False
+    diff_sum = th.autograd.Variable(th.zeros(1))
+    while iteration < n_iterations:
+        mins_per_cluster, min_var_inds = th.min(diffs, dim=0)
+        mins_per_var, min_cluster_inds = th.min(diffs, dim=1)
+        ind_range = th.autograd.Variable(
+            th.arange(0, len(min_cluster_inds)).type(th.LongTensor))
+        i_correct_vars = min_var_inds[min_cluster_inds] == ind_range
+        i_correct_clusters = min_cluster_inds[min_var_inds] == ind_range
+        diff_sum += th.sum(mins_per_var[i_correct_vars])
+        n_elements += th.sum(i_correct_clusters).type(th.FloatTensor)
+        i_incorrect_vars = (i_correct_vars ^ 1)
+        i_incorrect_clusters = (i_correct_clusters ^ 1)
+        if (th.sum(i_incorrect_vars) == 0).data.all():
+            finished_completely = True
             break
-    return diffs
+        diffs = diffs[th.nonzero(i_incorrect_vars).squeeze(), :][:,
+                th.nonzero(i_incorrect_clusters).squeeze()]
+        iteration += 1
 
-def greedy_min_dist_diff(var_a, var_b):
+    if not finished_completely:
+        remaining_mins, _ = th.min(diffs, dim=1)
+        diff_sum += th.sum(remaining_mins)
+        n_elements += remaining_mins.size()[0]
+        remaining_mins, _ = th.min(diffs, dim=0)
+        diff_sum += th.sum(remaining_mins)
+        n_elements += remaining_mins.size()[0]
+    mean_diff = diff_sum / n_elements
+    return mean_diff
+
+
+def greedy_min_dist_diff_matrix(var_a, var_b, n_iterations=3):
     diffs = pairwise_l1_dist(var_a, var_b)
-    diffs = greedy_unique_diffs(diffs)
-    mins, _ = th.min(diffs,dim=1)
-    return th.mean(mins)
+    mean_diff = greedy_unique_diff_matrix(diffs, n_iterations=n_iterations)
+    return mean_diff
