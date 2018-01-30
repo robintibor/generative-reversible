@@ -4,6 +4,7 @@ import numpy as np
 from scipy import interpolate
 import matplotlib.pyplot as plt
 from matplotlib import cm
+from braindecode.torch_ext.util import var_to_np
 
 class ReversibleBlock(th.nn.Module):
     def __init__(self, F, G):
@@ -56,11 +57,13 @@ def invert(feature_model, features):
             # for i_stride in range(self.stride):
             #    for j_stride in range(self.stride):
             #        new_x.append(x[:,:,i_stride::self.stride, j_stride::self.stride])
-            previous_features = th.autograd.Variable(
-                th.zeros(features.size()[0],
+            previous_features = th.zeros(features.size()[0],
                          features.size()[1] // (module.stride[0] * module.stride[1]),
                          features.size()[2] * module.stride[0],
-                         features.size()[3] * module.stride[1]).cuda())
+                         features.size()[3] * module.stride[1])
+            if y1.is_cuda:
+                previous_features = previous_features.cuda()
+            previous_features = th.autograd.Variable(previous_features)
 
             n_chans_before = previous_features.size()[1]
             cur_chan = 0
@@ -140,17 +143,29 @@ def min_diff_diff_greedy_loss(X,Y, n_iterations, distfunc, add_unmatched_diffs):
                                          n_iterations=n_iterations,
                                          distfunc=distfunc,
                                          add_unmatched_diffs=add_unmatched_diffs)
-    dist_X_X = greedy_min_dist_pair_diff(X, X,
-                                         n_iterations=n_iterations,
-                                         distfunc=distfunc,
-                                         add_unmatched_diffs=add_unmatched_diffs,
-                                         remove_diagonal=True)
-    dist_Y_Y = greedy_min_dist_pair_diff(Y, Y,
-                                         n_iterations=n_iterations,
-                                         distfunc=distfunc,
-                                         add_unmatched_diffs=add_unmatched_diffs,
-                                         remove_diagonal=True)
-    loss = 2 * dist_X_Y - dist_Y_Y - dist_X_X
+    #dist_X_X = greedy_min_dist_pair_diff(X, X,
+    #                                     n_iterations=n_iterations,
+    #                                     distfunc=distfunc,
+    #                                     add_unmatched_diffs=add_unmatched_diffs,
+    #                                     remove_diagonal=True)
+    #dist_Y_Y = greedy_min_dist_pair_diff(Y, Y,
+    #                                     n_iterations=n_iterations,
+    #                                     distfunc=distfunc,
+    #                                     add_unmatched_diffs=add_unmatched_diffs,
+    #                                     remove_diagonal=True)
+    n_half = len(X)//2
+    dist_X_X = greedy_min_dist_pair_diff(X[:n_half], X[n_half:],
+                                        n_iterations=n_iterations,
+                                        distfunc=distfunc,
+                                        add_unmatched_diffs=add_unmatched_diffs,
+                                        remove_diagonal=True)
+    dist_Y_Y = greedy_min_dist_pair_diff(Y[:n_half], Y[n_half:],
+                                        n_iterations=n_iterations,
+                                        distfunc=distfunc,
+                                        add_unmatched_diffs=add_unmatched_diffs,
+                                        remove_diagonal=True)
+    #loss = 2 * dist_X_Y - dist_Y_Y - dist_X_X
+    loss = dist_X_Y# / dist_X_X
     return loss
 
 
@@ -183,6 +198,8 @@ def greedy_unique_diff_matrix(diffs, n_iterations, add_unmatched_diffs):
     if diffs.is_cuda:
         diff_sum = diff_sum.cuda()
     while iteration < n_iterations:
+        # min_var_inds -> i_cluster_to_min_var
+        # min_cluster_inds -> i_var_to_min_cluster
         mins_per_cluster, min_var_inds = th.min(diffs, dim=0)
         mins_per_var, min_cluster_inds = th.min(diffs, dim=1)
         ind_range = th.autograd.Variable(
@@ -210,7 +227,7 @@ def greedy_unique_diff_matrix(diffs, n_iterations, add_unmatched_diffs):
             i_incorrect_clusters_float = i_incorrect_clusters_float.cuda()
         mask = (i_incorrect_vars_float.unsqueeze(1) *
                  i_incorrect_clusters_float.unsqueeze(0)) == 1
-        diffs = th.masked_select(diffs, mask).view(n_new_elements,
+        diffs = th.masked_select(diffs.clone(), mask).view(n_new_elements,
                                                    n_new_elements)
         iteration += 1
 
@@ -270,3 +287,133 @@ def log_gaussian_pdf(x, std):
     eps = 1e-6
     log_pdf = th.sum(log_pdf_per_dim + eps, dim=1)
     return log_pdf
+
+
+def rand_transport_loss(variables, directions, stds, expected_vals):
+    directions = th.autograd.Variable(directions, requires_grad=False)
+    norm_factors = th.norm(directions, p=2, dim=1, keepdim=True)
+    directions = directions / norm_factors
+    # norm for std
+    directions = directions / stds.unsqueeze(0)
+    var_out = th.mm(variables, directions.transpose(1, 0))
+    var_out, _ = th.sort(var_out, dim=0)
+    diffs = var_out - expected_vals.unsqueeze(1)
+    total_loss = th.mean(th.abs(diffs))
+    return total_loss
+
+def rand_transport_loss_sampled(variables, directions, stds):
+    directions = th.autograd.Variable(directions, requires_grad=False)
+    norm_factors = th.norm(directions, p=2, dim=1, keepdim=True)
+    directions = directions / norm_factors
+    # norm for std
+    samples = th.autograd.Variable(th.randn(variables.size())) * stds.unsqueeze(0)
+    directed_samples = th.mm(samples, directions.transpose(1, 0))
+    sorted_samples, _ = th.sort(directed_samples, dim=0)
+    var_out = th.mm(variables, directions.transpose(1, 0))
+    var_out, _ = th.sort(var_out, dim=0)
+    diffs = var_out - sorted_samples
+    total_loss = th.mean(th.abs(diffs))
+    return total_loss
+
+def sample_mixture_gaussian(sizes_per_cluster, means_per_dim, stds_per_dim):
+    parts = []
+    for n_samples, mean, std  in zip(sizes_per_cluster, means_per_dim, stds_per_dim):
+        if n_samples == 0: continue
+        samples = th.randn(n_samples, std.size()[0])
+        samples = th.autograd.Variable(samples)
+        if std.is_cuda:
+            samples = samples.cuda()
+        samples = samples * std.unsqueeze(0) + mean.unsqueeze(0)
+        parts.append(samples)
+
+    all_samples = th.cat(parts, dim=0)
+    return all_samples
+
+
+def sizes_from_weights(size, weights, ):
+    weights = weights / np.sum(weights)
+    fractional_sizes = weights * size
+
+    rounded = np.int64(np.round(fractional_sizes))
+    diff_with_half =  (fractional_sizes % 1) - 0.5
+
+    n_total = np.sum(rounded)
+    # Those closest to 0.5 rounded, take next biggest or next smallest number
+    # to match wanted overall size
+    while n_total > size:
+        i_min = np.argsort(diff_with_half[diff_with_half > 0])[0]
+        i_min = np.flatnonzero(diff_with_half > 0)[i_min]
+        diff_with_half[i_min] += 0.5
+        rounded[i_min] -= 1
+        n_total -= 1
+    while n_total < size:
+        i_min = np.argsort(-diff_with_half[diff_with_half < 0])[0]
+        i_min = np.flatnonzero(diff_with_half < 0)[i_min]
+        diff_with_half[i_min] -= 0.5
+        rounded[i_min] += 1
+        n_total += 1
+
+    assert np.sum(rounded) == size
+    # pytorch needs list of int
+    sizes = [int(s) for s in rounded]
+    return sizes
+
+
+def get_weights_per_sample(weights_per_cluster, sizes):
+    all_weights = []
+    for i_cluster in range(len(sizes)):
+        size = sizes[i_cluster]
+        weight = weights_per_cluster[i_cluster]
+        if size == 0:
+            continue
+        assert size > 0
+        np_weight = float(var_to_np(weight))
+        assert np_weight >= 0
+        if np_weight > 0:
+            new_weight = weight / np_weight
+        else:
+            new_weight = weight # should be 0
+        all_weights.append(new_weight.expand(size))
+    return th.cat(all_weights)
+
+
+def rand_transport_loss_both_sampled(samples_a, samples_b, weights_b, directions,
+                                     abs_or_square):
+    weighted_diffs = rand_transport_diffs_both_sampled(samples_a, samples_b, weights_b, directions)
+    if abs_or_square == 'abs':
+        total_loss = th.mean(th.abs(weighted_diffs))
+    else:
+        assert abs_or_square == 'square'
+        total_loss = th.mean(weighted_diffs * weighted_diffs)
+    return total_loss
+
+
+def rand_transport_diffs_both_sampled(samples_a, samples_b, weights_b, directions):
+    if th.is_tensor(directions):
+        directions = th.autograd.Variable(directions, requires_grad=False)
+    norm_factors = th.norm(directions, p=2, dim=1, keepdim=True)
+    directions = directions / norm_factors
+    directed_samples_a = th.mm(samples_a, directions.transpose(1, 0))
+    sorted_samples_a, _ = th.sort(directed_samples_a, dim=0)
+    directed_samples_b = th.mm(samples_b, directions.transpose(1, 0))
+    sorted_samples_b, sort_inds = th.sort(directed_samples_b, dim=0)
+    diffs = sorted_samples_b - sorted_samples_a
+    weighted_diffs = th.cat([(weights_b[sort_inds[:, i_dim]] *
+                              diffs[:, i_dim]).unsqueeze(1)
+                             for i_dim in range(sort_inds.size()[1])], dim=1)
+    return weighted_diffs
+
+
+def compute_transport_loss(batch_outs, weights_per_cluster, means_per_dim, stds_per_dim):
+    batch_size = len(batch_outs)
+    directions = th.randn(batch_outs.size()[1], batch_outs.size()[1])
+    directions, _ = th.qr(directions)
+    directions = directions.cuda()
+    sizes = sizes_from_weights(batch_size, var_to_np(weights_per_cluster))
+    samples = sample_mixture_gaussian(sizes, means_per_dim, stds_per_dim)
+    normed_weights = weights_per_cluster / th.sum(weights_per_cluster)
+    weights_per_sample = get_weights_per_sample(normed_weights, sizes)
+    this_transport_loss = rand_transport_loss_both_sampled(batch_outs, samples, weights_per_sample,
+                                directions, 'abs')
+    return this_transport_loss
+
