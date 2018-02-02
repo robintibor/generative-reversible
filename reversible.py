@@ -290,11 +290,8 @@ def log_gaussian_pdf(x, std):
 
 
 def rand_transport_loss(variables, directions, stds, expected_vals):
-    directions = th.autograd.Variable(directions, requires_grad=False)
-    norm_factors = th.norm(directions, p=2, dim=1, keepdim=True)
-    directions = directions / norm_factors
-    # norm for std
-    directions = directions / stds.unsqueeze(0)
+    directions = sample_directions(variables.size()[1], orthogonalize=True,
+                                cuda=variables.is_cuda)
     var_out = th.mm(variables, directions.transpose(1, 0))
     var_out, _ = th.sort(var_out, dim=0)
     diffs = var_out - expected_vals.unsqueeze(1)
@@ -302,9 +299,8 @@ def rand_transport_loss(variables, directions, stds, expected_vals):
     return total_loss
 
 def rand_transport_loss_sampled(variables, directions, stds):
-    directions = th.autograd.Variable(directions, requires_grad=False)
-    norm_factors = th.norm(directions, p=2, dim=1, keepdim=True)
-    directions = directions / norm_factors
+    directions = sample_directions(variables.size()[1], orthogonalize=True,
+                                cuda=variables.is_cuda)
     # norm for std
     samples = th.autograd.Variable(th.randn(variables.size())) * stds.unsqueeze(0)
     directed_samples = th.mm(samples, directions.transpose(1, 0))
@@ -317,17 +313,18 @@ def rand_transport_loss_sampled(variables, directions, stds):
 
 
 def sample_mixture_gaussian(sizes_per_cluster, means_per_dim, stds_per_dim):
+    # assume mean/std are clusters x dims
     parts = []
+    n_dims = means_per_dim.size()[1]
     for n_samples, mean, std  in zip(sizes_per_cluster, means_per_dim, stds_per_dim):
         if n_samples == 0: continue
         assert n_samples > 0
-        samples = th.randn(n_samples, std.size()[0])
+        samples = th.randn(n_samples, n_dims)
         samples = th.autograd.Variable(samples)
         if std.is_cuda:
             samples = samples.cuda()
         samples = samples * std.unsqueeze(0) + mean.unsqueeze(0)
         parts.append(samples)
-
     all_samples = th.cat(parts, dim=0)
     return all_samples
 
@@ -419,10 +416,8 @@ def rand_transport_diffs_both_sampled(samples_a, samples_b, weights_b, direction
 def compute_transport_loss(batch_outs, weights_per_cluster, means_per_dim, stds_per_dim,
                            abs_or_square, sample_gauss_repetitions=1):
     batch_size = len(batch_outs)
-    directions = th.randn(batch_outs.size()[1], batch_outs.size()[1])
-    directions, _ = th.qr(directions)
-    if weights_per_cluster.is_cuda:
-        directions = directions.cuda()
+    directions = sample_directions(batch_outs.size()[1], orthogonalize=True,
+                                cuda=batch_outs.is_cuda)
     if sample_gauss_repetitions == 1:
         sizes = sizes_from_weights(batch_size, var_to_np(weights_per_cluster))
         normed_weights = weights_per_cluster / th.sum(weights_per_cluster)
@@ -437,15 +432,18 @@ def compute_transport_loss(batch_outs, weights_per_cluster, means_per_dim, stds_
     return this_transport_loss
 
 
-def repeated_rand_transport_diffs_both_sampled(batch_outs, weights_per_cluster, means_per_dim, stds_per_dim,
-                           directions, abs_or_square, sample_gauss_repetitions=1):
+def norm_and_var_directions(directions):
     if th.is_tensor(directions):
         directions = th.autograd.Variable(directions, requires_grad=False)
     norm_factors = th.norm(directions, p=2, dim=1, keepdim=True)
     directions = directions / norm_factors
+    return directions
+
+def repeated_rand_transport_diffs_both_sampled(batch_outs, weights_per_cluster, means_per_dim, stds_per_dim,
+                           directions, abs_or_square, sample_gauss_repetitions=1):
+    directions = norm_and_var_directions(directions)
     directed_samples_batch = th.mm(batch_outs, directions.transpose(1, 0))
     sorted_samples_batch, _ = th.sort(directed_samples_batch, dim=0)
-
     sizes = sizes_from_weights(len(batch_outs), var_to_np(weights_per_cluster))
     normed_weights = weights_per_cluster / th.sum(weights_per_cluster)
     weights_per_sample = get_weights_per_sample(normed_weights, sizes)
@@ -502,9 +500,10 @@ def compute_sample_points_gaussian_mixture(means_per_dim, stds_per_dim,
 
 def multi_directions_gaussian_cdfs(x, means, stds, weights):
     ## and https://en.wikipedia.org/wiki/Normal_distribution#Cumulative_distribution_function
-    # now assuming means/stds are directions x clusters
-    # weights is 1-dimension (number of clusters)
     # assuming input x is directions x 1-dimensional points
+    # assuming means/stds are directions x clusters
+    # weights is 1-dimension (number of clusters)
+    weights = weights / th.sum(weights)
     cdfs = 0.5 * (1 +
             th.erf((x.unsqueeze(2) - means.unsqueeze(1)) / (
                 stds.unsqueeze(1) * np.sqrt(2))))
@@ -522,8 +521,10 @@ def transform_gaussian_by_dirs(means, stds, directions):
     # transformed_means is now
     # directions x clusters
     stds_for_dirs = stds.transpose(1, 0).unsqueeze(0)  # 1 x dims x clusters
-    transformed_stds = th.sum(
-        (directions * directions).unsqueeze(2) * stds_for_dirs, dim=1)
+    transformed_stds = th.sqrt(th.sum(
+        (directions * directions).unsqueeze(2) *
+        (stds_for_dirs * stds_for_dirs),
+        dim=1))
     # transformed_stds is now
     # directions x clusters
     return transformed_means, transformed_stds
@@ -540,6 +541,8 @@ def compute_multi_dir_sample_points_gaussian_mixture(dir_means, dir_stds,
         start = float(th.min(this_mean - this_std * 4).data)
         stop = float(th.max(this_mean + this_std * 4).data)
         x = th.linspace(start, stop, n_interpolation_points)
+        if dir_means.is_cuda:
+            x = x.cuda()
         all_x.append(x)
 
     x = th.stack(all_x, dim=0)
@@ -555,8 +558,10 @@ def compute_multi_dir_sample_points_gaussian_mixture(dir_means, dir_stds,
     # Compute inverse cdf at those probabilities
     # (Assuming delta distribution as pdf and corresponding cdf
     # for samples)
-    wanted_probs = th.autograd.Variable(
-        th.linspace(1 / n_samples, 1 - 1 / n_samples, n_samples))
+    wanted_probs = th.linspace(1 / n_samples, 1 - 1 / n_samples, n_samples)
+    if dir_means.is_cuda:
+        wanted_probs = wanted_probs.cuda()
+    wanted_probs = th.autograd.Variable(wanted_probs)
 
     # find minima for each probability
     # for each direction
@@ -572,16 +577,23 @@ def compute_multi_dir_sample_points_gaussian_mixture(dir_means, dir_stds,
     all_sample_points = th.stack(all_sample_points, dim=0)
     return all_sample_points
 
+def sample_directions(n_dims, orthogonalize, cuda):
+    directions = th.randn(n_dims, n_dims)
+    if orthogonalize:
+        directions, _ = th.qr(directions)
+
+    if cuda:
+        directions = directions.cuda()
+    directions = th.autograd.Variable(directions, requires_grad=False)
+    norm_factors = th.norm(directions, p=2, dim=1, keepdim=True)
+    directions = directions / norm_factors
+    return directions
 
 def symmetric_analytic_transport_loss(batch_outs, means_per_dim, stds_per_dim,
                                      weights_per_cluster,
                                      n_interpolation_points):
-    directions = th.randn(batch_outs.size()[1], batch_outs.size()[1])
-    directions, _ = th.qr(directions)
-
-    directions = th.autograd.Variable(directions, requires_grad=False)
-    norm_factors = th.norm(directions, p=2, dim=1, keepdim=True)
-    directions = directions / norm_factors
+    directions = sample_directions(batch_outs.size()[1], orthogonalize=True,
+                                cuda=batch_outs.is_cuda)
 
     projected_outs = th.mm(batch_outs, directions.transpose(1, 0)).transpose(1,0)
     # now directions x outs
@@ -605,8 +617,17 @@ def symmetric_analytic_transport_loss(batch_outs, means_per_dim, stds_per_dim,
     # Loop over directions
     for this_weights, this_ins, this_assigned_1, this_assigned_2 in zip(
             weight_per_assignment, sorted_outs, i_assigned_1, i_assigned_2):
-        assigned_inputs = this_weights.unsqueeze(1) * this_ins[this_assigned_1.data.type(th.LongTensor)] + (
-            (1 - this_weights)).unsqueeze(1) * this_ins[this_assigned_2.data.type(th.LongTensor)]
+        assigned_1_data = this_assigned_1.data
+        assigned_2_data = this_assigned_2.data
+        if this_ins.is_cuda:
+            assigned_1_data = assigned_1_data.type(th.cuda.LongTensor)
+            assigned_2_data = assigned_2_data.type(th.cuda.LongTensor)
+        else:
+            assigned_1_data = assigned_1_data.type(th.LongTensor)
+            assigned_2_data = assigned_2_data.type(th.LongTensor)
+
+        assigned_inputs = this_weights.unsqueeze(1) * this_ins[assigned_1_data] + (
+            (1 - this_weights)).unsqueeze(1) * this_ins[assigned_2_data]
         diffs = th.autograd.Variable(this_ins.data) - assigned_inputs
         loss = th.mean(diffs * diffs)
         gaussian_cdf_to_points_losses.append(loss)
@@ -621,3 +642,191 @@ def symmetric_analytic_transport_loss(batch_outs, means_per_dim, stds_per_dim,
     loss = th.mean(th.cat(gaussian_cdf_to_points_losses)) + empirical_cdf_to_gaussian_loss
     return loss
 
+
+def kl_cum_div(a_cdf, b_cdf, mean_a, mean_b):
+    eps = 1e-6
+    #http://onlinelibrary.wiley.com/doi/10.1002/asmb.2116/full
+    return th.mean(a_cdf * (th.log(a_cdf+ eps) - th.log(b_cdf + eps))) + th.mean(th.abs(mean_a - mean_b))
+
+
+def symmetric_kl_cum_div(a_cdf, b_cdf, mean_a, mean_b):
+    return kl_cum_div(a_cdf, b_cdf, mean_a, mean_b) + kl_cum_div(b_cdf, a_cdf, mean_b, mean_a)
+
+
+def analytic_kl_div(samples, means_per_dim, stds_per_dim,
+                                     weights_per_cluster):
+    directions = sample_directions(n_dims=samples.size()[1], orthogonalize=True, cuda=samples.is_cuda)
+    analytical_cdf, empirical_cdf, analytical_means, empirical_means = analytical_empirical_cdf(
+        samples, directions, means_per_dim, stds_per_dim, weights_per_cluster)
+    kl_div = symmetric_kl_cum_div(analytical_cdf,empirical_cdf, analytical_means, empirical_means)
+    return kl_div
+
+
+def analytical_empirical_cdf(
+        samples, directions, means_per_dim, stds_per_dim, weights_per_cluster):
+    projected_samples = th.mm(samples, directions.t())
+    sorted_samples, _ = th.sort(projected_samples, dim=0)
+    mean_dirs, std_dirs = transform_gaussian_by_dirs(means_per_dim,
+                                                     stds_per_dim, directions)
+
+    assert (weights_per_cluster >= 0).data.all()
+    normed_weights = weights_per_cluster / th.sum(weights_per_cluster)
+    analytical_cdf = multi_directions_gaussian_cdfs(sorted_samples.t(),
+                                                    mean_dirs, std_dirs,
+                                                    normed_weights)
+    analytical_means = th.sum(mean_dirs * normed_weights, dim=1)
+
+    empirical_means = th.mean(sorted_samples, dim=0)
+
+    n_samples = len(sorted_samples)
+    empirical_cdf = th.linspace(1 / n_samples, 1 - 1 / n_samples, n_samples).unsqueeze(0)
+    empirical_cdf = th.autograd.Variable(empirical_cdf)
+    return analytical_cdf, empirical_cdf, analytical_means, empirical_means
+
+
+def analytical_l2_cdf_loss(samples, means_per_dim, stds_per_dim,
+                                     weights_per_cluster, directions=None):
+    if directions is None:
+        directions = sample_directions(n_dims=samples.size()[1],
+                                       orthogonalize=True, cuda=samples.is_cuda)
+    analytical_cdf, empirical_cdf, analytical_means, empirical_means = analytical_empirical_cdf(
+            samples, directions, means_per_dim, stds_per_dim, weights_per_cluster)
+
+    diffs = analytical_cdf - empirical_cdf
+    return th.mean(th.sqrt(th.sum(diffs * diffs, dim=1)))
+
+
+
+
+def analytical_komolgorov_loss(samples, means_per_dim, stds_per_dim,
+                                     weights_per_cluster):
+    directions = sample_directions(n_dims=samples.size()[1], orthogonalize=True, cuda=samples.is_cuda)
+    analytical_cdf, empirical_cdf, analytical_means, empirical_means = analytical_empirical_cdf(
+            samples, directions, means_per_dim, stds_per_dim, weights_per_cluster)
+
+    diffs = analytical_cdf - empirical_cdf
+    return th.max(diffs * diffs)
+
+
+def ensure_on_same_device(*variables):
+    any_cuda = np.any([v.is_cuda for v in variables])
+    if any_cuda:
+        variables = [ensure_cuda(v) for v in variables]
+    return variables
+
+
+def ensure_cuda(v):
+    if not v.is_cuda:
+        v = v.cuda()
+    return v
+
+
+def projected_samples_mixture_sorted(weights_per_cluster, means_per_dim,
+                                     stds_per_dim,
+                                     directions, n_samples,
+                                     n_interpolation_samples):
+    sizes = sizes_from_weights(n_interpolation_samples,
+                               var_to_np(weights_per_cluster))
+    dir_means, dir_stds = transform_gaussian_by_dirs(means_per_dim,
+                                                     stds_per_dim, directions)
+    cluster_samples = sample_mixture_gaussian(sizes, dir_means.t(),
+                                              dir_stds.t())
+    sorted_cluster_samples, _ = th.sort(cluster_samples, dim=0)
+    offset_x_in_input = -0.5 + 0.5 * (
+        len(sorted_cluster_samples) / n_samples)
+    x_grid = th.linspace(offset_x_in_input,
+                         len(sorted_cluster_samples) - 1 - offset_x_in_input,
+                         n_samples)
+    i_low = th.floor(x_grid)
+    i_high = th.ceil(x_grid)
+    weights_high = x_grid - i_low
+    i_low = th.clamp(i_low, min=0)
+    i_high = th.clamp(i_high, max=n_interpolation_samples-1)
+    i_low = i_low.type(th.LongTensor)
+    i_high = i_high.type(th.LongTensor)
+    weights_high = th.autograd.Variable(weights_high)
+    i_low, i_high, sorted_cluster_samples, weights_high = ensure_on_same_device(
+        i_low, i_high, sorted_cluster_samples, weights_high)
+    vals_low = sorted_cluster_samples[i_low]
+    vals_high = sorted_cluster_samples[i_high]
+    vals_interpolated = (vals_low * (1 - weights_high).unsqueeze(
+        1)) + (vals_high * weights_high.unsqueeze(1))
+    return vals_interpolated
+
+
+def sampled_transport_diffs_interpolate_sorted(batch_outs, weights_per_cluster,
+                                               means_per_dim, stds_per_dim,
+                                               directions, abs_or_square,
+                                               n_interpolation_samples):
+    directions = norm_and_var_directions(directions)
+    directed_samples_batch = th.mm(batch_outs, directions.transpose(1, 0))
+    sorted_samples_batch, _ = th.sort(directed_samples_batch, dim=0)
+    sorted_samples_cluster = projected_samples_mixture_sorted(
+        weights_per_cluster, means_per_dim, stds_per_dim,
+        directions, len(batch_outs),
+        n_interpolation_samples=n_interpolation_samples)
+    diffs = sorted_samples_cluster - sorted_samples_batch
+    if abs_or_square == 'abs':
+        total_loss = th.mean(th.abs(diffs))
+    else:
+        assert abs_or_square == 'square'
+        total_loss = th.mean(diffs * diffs)
+    return total_loss
+
+
+def analytical_l2_cdf_and_sample_transport_loss(
+        samples, means_per_dim, stds_per_dim, weights_per_cluster, abs_or_square,
+        n_interpolation_samples,
+        cuda=False, directions=None):
+    # common
+    if directions is None:
+        directions = sample_directions(samples.size()[1], True, cuda=cuda)
+    else:
+        directions = norm_and_var_directions(directions)
+
+    projected_samples = th.mm(samples, directions.t())
+    sorted_samples, _ = th.sort(projected_samples, dim=0)
+    cdf_loss =  analytical_l2_cdf_loss_given_sorted_samples(
+        sorted_samples, directions,
+        means_per_dim, stds_per_dim, weights_per_cluster)
+    sample_loss =  sampled_transport_diffs_interpolate_sorted_part(
+        sorted_samples, directions, means_per_dim,
+        stds_per_dim, weights_per_cluster, n_interpolation_samples,
+        abs_or_square=abs_or_square)
+    return cdf_loss, sample_loss
+
+def analytical_l2_cdf_loss_given_sorted_samples(
+        sorted_samples_batch, directions,
+        means_per_dim, stds_per_dim, weights_per_cluster):
+    n_samples = len(sorted_samples_batch)
+    mean_dirs, std_dirs = transform_gaussian_by_dirs(
+        means_per_dim, stds_per_dim, directions)
+    assert (weights_per_cluster >= 0).data.all()
+    normed_weights = weights_per_cluster / th.sum(weights_per_cluster)
+    analytical_cdf = multi_directions_gaussian_cdfs(sorted_samples_batch.t(),
+                                                    mean_dirs, std_dirs,
+                                                    normed_weights)
+    empirical_cdf = th.linspace(1 / (n_samples + 1), 1 - (1 / (n_samples+1)),
+                                n_samples).unsqueeze(0)
+    empirical_cdf = th.autograd.Variable(empirical_cdf)
+    directions, empirical_cdf = ensure_on_same_device(directions, empirical_cdf)
+    diffs = analytical_cdf - empirical_cdf
+    #cdf_loss = th.mean(th.sqrt(th.sum(diffs * diffs, dim=1)))
+    cdf_loss = th.mean(th.sqrt(th.mean(diffs * diffs, dim=1)))
+    return cdf_loss
+
+def sampled_transport_diffs_interpolate_sorted_part(
+        sorted_samples_batch, directions, means_per_dim,
+        stds_per_dim, weights_per_cluster, n_interpolation_samples, abs_or_square):
+    # sampling based stuff
+    sorted_samples_cluster = projected_samples_mixture_sorted(
+        weights_per_cluster, means_per_dim, stds_per_dim,
+        directions, len(sorted_samples_batch),
+        n_interpolation_samples=n_interpolation_samples)
+    diffs = sorted_samples_cluster - sorted_samples_batch
+    if abs_or_square == 'abs':
+        sample_loss = th.mean(th.abs(diffs))
+    else:
+        assert abs_or_square == 'square'
+        sample_loss = th.mean(diffs * diffs)
+    return sample_loss
