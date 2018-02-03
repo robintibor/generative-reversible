@@ -298,7 +298,8 @@ def projected_samples_mixture_sorted(
 def analytical_l2_cdf_and_sample_transport_loss(
         samples, means_per_dim, stds_per_dim, weights_per_cluster, abs_or_square,
         n_interpolation_samples,
-        cuda=False, directions=None, backprop_sample_loss_to_cluster_weights=False):
+        cuda=False, directions=None, backprop_sample_loss_to_cluster_weights=False,
+        normalize_by_stds=False):
     # common
     if directions is None:
         directions = sample_directions(samples.size()[1], True, cuda=cuda)
@@ -314,7 +315,8 @@ def analytical_l2_cdf_and_sample_transport_loss(
         sorted_samples, directions, means_per_dim,
         stds_per_dim, weights_per_cluster, n_interpolation_samples,
         abs_or_square=abs_or_square,
-        backprop_to_cluster_weights=backprop_sample_loss_to_cluster_weights)
+        backprop_to_cluster_weights=backprop_sample_loss_to_cluster_weights,
+        normalize_by_stds=normalize_by_stds)
     return cdf_loss, sample_loss
 
 
@@ -344,7 +346,7 @@ def analytical_l2_cdf_loss_given_sorted_samples(
 def sampled_transport_diffs_interpolate_sorted_part(
         sorted_samples_batch, directions, means_per_dim,
         stds_per_dim, weights_per_cluster, n_interpolation_samples, abs_or_square,
-        backprop_to_cluster_weights):
+        backprop_to_cluster_weights, normalize_by_stds):
     # sampling based stuff
     sorted_samples_cluster, diff_weights = projected_samples_mixture_sorted(
         weights_per_cluster, means_per_dim, stds_per_dim,
@@ -352,8 +354,22 @@ def sampled_transport_diffs_interpolate_sorted_part(
         n_interpolation_samples=n_interpolation_samples,
         backprop_to_cluster_weights=backprop_to_cluster_weights)
     diffs = sorted_samples_cluster - sorted_samples_batch
+    if normalize_by_stds:
+        dir_means, dir_stds = transform_gaussian_by_dirs(
+            means_per_dim, stds_per_dim, directions)
+        sizes = sizes_from_weights(len(sorted_samples_batch),
+                                   var_to_np(weights_per_cluster))
+        # repeat stds at expected positions
+        # stds are directions x clusters!
+        std_factors = th.cat([
+            dir_stds[:, i_cluster:i_cluster + 1].repeat(1, size)
+            for i_cluster, size in enumerate(sizes)], dim=1)
+        # now directions x samples
+        diffs = diffs / std_factors.t() # to samples x directions
+
     if abs_or_square == 'abs':
         if backprop_to_cluster_weights:
+            print(diffs)
             sample_loss = th.mean(th.abs(diffs) * diff_weights)
         else:
             sample_loss = th.mean(th.abs(diffs))
