@@ -252,7 +252,7 @@ def ensure_cuda(v):
 def projected_samples_mixture_sorted(
         weights_per_cluster, means_per_dim, stds_per_dim,
         directions, n_samples, n_interpolation_samples,
-        backprop_to_cluster_weights):
+        backprop_to_cluster_weights, compute_stds_per_sample):
     sizes = sizes_from_weights(n_interpolation_samples,
                                var_to_np(weights_per_cluster))
     dir_means, dir_stds = transform_gaussian_by_dirs(means_per_dim,
@@ -268,6 +268,22 @@ def projected_samples_mixture_sorted(
             [weights_per_sample[sort_inds[:, i_dim]]
              for i_dim in range(sort_inds.size()[1])],
             dim=1)
+    if compute_stds_per_sample:
+        # these are std factors per sample, unsorted
+        std_factors = []
+        for i_cluster, size in enumerate(sizes):
+            if size > 0:
+                std_factors.append(
+                    dir_stds[:, i_cluster:i_cluster + 1].repeat(1, size))
+        std_factors = th.cat(std_factors, dim=1)
+        # now directions x samples
+        std_factors = std_factors.t()
+        # now samples x directions
+        std_per_sample = th.stack(
+            [std_factors[:, i_dim][sort_inds[:, i_dim]]
+             for i_dim in range(sort_inds.size()[1])],
+            dim=1)
+
     offset_x_in_input = -0.5 + 0.5 * (
         len(sorted_cluster_samples) / n_samples)
     x_grid = th.linspace(offset_x_in_input,
@@ -292,7 +308,12 @@ def projected_samples_mixture_sorted(
                               weights_per_sample[i_high] * weights_high.unsqueeze(1))
     else:
         weights_per_sample = None
-    return vals_interpolated, weights_per_sample
+    if compute_stds_per_sample:
+        std_per_sample = (std_per_sample[i_low] * (1 - weights_high).unsqueeze(1) +
+                              std_per_sample[i_high] * weights_high.unsqueeze(1))
+    else:
+        std_per_sample = None
+    return vals_interpolated, weights_per_sample, std_per_sample
 
 
 def analytical_l2_cdf_and_sample_transport_loss(
@@ -348,28 +369,20 @@ def sampled_transport_diffs_interpolate_sorted_part(
         stds_per_dim, weights_per_cluster, n_interpolation_samples, abs_or_square,
         backprop_to_cluster_weights, normalize_by_stds):
     # sampling based stuff
-    sorted_samples_cluster, diff_weights = projected_samples_mixture_sorted(
+    sorted_samples_cluster, diff_weights, stds_per_sample = projected_samples_mixture_sorted(
         weights_per_cluster, means_per_dim, stds_per_dim,
         directions, len(sorted_samples_batch),
         n_interpolation_samples=n_interpolation_samples,
-        backprop_to_cluster_weights=backprop_to_cluster_weights)
+        backprop_to_cluster_weights=backprop_to_cluster_weights,
+        compute_stds_per_sample=normalize_by_stds)
     diffs = sorted_samples_cluster - sorted_samples_batch
     if normalize_by_stds:
-        dir_means, dir_stds = transform_gaussian_by_dirs(
-            means_per_dim, stds_per_dim, directions)
-        sizes = sizes_from_weights(len(sorted_samples_batch),
-                                   var_to_np(weights_per_cluster))
-        # repeat stds at expected positions
-        # stds are directions x clusters!
-        std_factors = th.cat([
-            dir_stds[:, i_cluster:i_cluster + 1].repeat(1, size)
-            for i_cluster, size in enumerate(sizes)], dim=1)
-        # now directions x samples
-        diffs = diffs / std_factors.t() # to samples x directions
+        diffs = diffs / stds_per_sample
+    else:
+        assert stds_per_sample is None
 
     if abs_or_square == 'abs':
         if backprop_to_cluster_weights:
-            print(diffs)
             sample_loss = th.mean(th.abs(diffs) * diff_weights)
         else:
             sample_loss = th.mean(th.abs(diffs))
