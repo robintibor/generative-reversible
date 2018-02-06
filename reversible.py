@@ -195,6 +195,8 @@ def multi_directions_gaussian_cdfs(x, means, stds, weights):
     # assuming input x is directions x 1-dimensional points
     # assuming means/stds are directions x clusters
     # weights is 1-dimension (number of clusters)
+    eps = 1e-6
+    stds = th.clamp(stds, min=eps)
     weights = weights / th.sum(weights)
     cdfs = 0.5 * (1 +
             th.erf((x.unsqueeze(2) - means.unsqueeze(1)) / (
@@ -319,8 +321,8 @@ def projected_samples_mixture_sorted(
 def analytical_l2_cdf_and_sample_transport_loss(
         samples, means_per_dim, stds_per_dim, weights_per_cluster, abs_or_square,
         n_interpolation_samples,
-        cuda=False, directions=None, backprop_sample_loss_to_cluster_weights=False,
-        normalize_by_stds=False):
+        cuda=False, directions=None, backprop_sample_loss_to_cluster_weights=True,
+        normalize_by_stds=True, energy_sample_loss=False):
     # common
     if directions is None:
         directions = sample_directions(samples.size()[1], True, cuda=cuda)
@@ -332,14 +334,37 @@ def analytical_l2_cdf_and_sample_transport_loss(
     cdf_loss =  analytical_l2_cdf_loss_given_sorted_samples(
         sorted_samples, directions,
         means_per_dim, stds_per_dim, weights_per_cluster)
-    sample_loss =  sampled_transport_diffs_interpolate_sorted_part(
-        sorted_samples, directions, means_per_dim,
-        stds_per_dim, weights_per_cluster, n_interpolation_samples,
-        abs_or_square=abs_or_square,
-        backprop_to_cluster_weights=backprop_sample_loss_to_cluster_weights,
-        normalize_by_stds=normalize_by_stds)
+    if energy_sample_loss:
+        sample_loss = sampled_energy_transport_loss(
+            projected_samples, directions,
+            means_per_dim, stds_per_dim, weights_per_cluster,
+            abs_or_square,
+            backprop_to_cluster_weights=backprop_sample_loss_to_cluster_weights,
+            normalize_by_stds=normalize_by_stds)
+    else:
+        sample_loss =  sampled_transport_diffs_interpolate_sorted_part(
+            sorted_samples, directions, means_per_dim,
+            stds_per_dim, weights_per_cluster, n_interpolation_samples,
+            abs_or_square=abs_or_square,
+            backprop_to_cluster_weights=backprop_sample_loss_to_cluster_weights,
+            normalize_by_stds=normalize_by_stds)
     return cdf_loss, sample_loss
 
+def analytical_l2_cdf_loss(
+        samples, means_per_dim, stds_per_dim, weights_per_cluster,
+        cuda=False, directions=None, ):
+    # common
+    if directions is None:
+        directions = sample_directions(samples.size()[1], True, cuda=cuda)
+    else:
+        directions = norm_and_var_directions(directions)
+
+    projected_samples = th.mm(samples, directions.t())
+    sorted_samples, _ = th.sort(projected_samples, dim=0)
+    cdf_loss = analytical_l2_cdf_loss_given_sorted_samples(
+        sorted_samples, directions,
+        means_per_dim, stds_per_dim, weights_per_cluster)
+    return cdf_loss
 
 def analytical_l2_cdf_loss_given_sorted_samples(
         sorted_samples_batch, directions,
@@ -347,7 +372,7 @@ def analytical_l2_cdf_loss_given_sorted_samples(
     n_samples = len(sorted_samples_batch)
     mean_dirs, std_dirs = transform_gaussian_by_dirs(
         means_per_dim, stds_per_dim, directions)
-    assert (weights_per_cluster >= 0).data.all()
+    assert (th.sum(weights_per_cluster) >= 0).data.all()
     normed_weights = weights_per_cluster / th.sum(weights_per_cluster)
     analytical_cdf = multi_directions_gaussian_cdfs(sorted_samples_batch.t(),
                                                     mean_dirs, std_dirs,
@@ -359,8 +384,8 @@ def analytical_l2_cdf_loss_given_sorted_samples(
     empirical_cdf = th.autograd.Variable(empirical_cdf)
     directions, empirical_cdf = ensure_on_same_device(directions, empirical_cdf)
     diffs = analytical_cdf - empirical_cdf
-    #cdf_loss = th.mean(th.sqrt(th.sum(diffs * diffs, dim=1)))
-    cdf_loss = th.mean(th.sqrt(th.mean(diffs * diffs, dim=1)))
+    cdf_loss = th.mean(th.sqrt(th.sum(diffs * diffs, dim=1)))
+    #cdf_loss = th.mean(th.sqrt(th.mean(diffs * diffs, dim=1)))
     return cdf_loss
 
 
@@ -389,7 +414,73 @@ def sampled_transport_diffs_interpolate_sorted_part(
     else:
         assert abs_or_square == 'square'
         if backprop_to_cluster_weights:
-            sample_loss = th.mean((diffs * diffs) * diff_weights)
+            sample_loss = th.sqrt(th.mean((diffs * diffs) * diff_weights))
         else:
-            sample_loss = th.mean(diffs * diffs)
+            sample_loss = th.sqrt(th.mean(diffs * diffs))
     return sample_loss
+
+def sampled_energy_transport_loss(
+        projected_samples, directions,
+        means_per_dim, stds_per_dim, weights_per_cluster,
+        abs_or_square,
+        backprop_to_cluster_weights,
+        normalize_by_stds):
+    permuted_samples = projected_samples[th.randperm(len(projected_samples))]
+    proj_samples_a, proj_samples_b = th.chunk(permuted_samples, 2)
+    sorted_samples_a, _ = th.sort(proj_samples_a, dim=0)
+    sorted_samples_b, _ = th.sort(proj_samples_b, dim=0)
+    sorted_samples_cluster_a, diff_weights_a, stds_per_sample_a = projected_samples_mixture_sorted(
+        weights_per_cluster, means_per_dim, stds_per_dim,
+        directions, len(sorted_samples_a),
+        n_interpolation_samples=len(sorted_samples_a),
+        backprop_to_cluster_weights=backprop_to_cluster_weights,
+        compute_stds_per_sample=normalize_by_stds)
+    eps = 1e-6
+    if stds_per_sample_a is not None:
+        stds_per_sample_a = th.clamp(stds_per_sample_a, min=eps)
+    sorted_samples_cluster_b, diff_weights_b, stds_per_sample_b = projected_samples_mixture_sorted(
+        weights_per_cluster, means_per_dim, stds_per_dim,
+        directions, len(sorted_samples_b),
+        n_interpolation_samples=len(sorted_samples_a),
+        backprop_to_cluster_weights=backprop_to_cluster_weights,
+        compute_stds_per_sample=normalize_by_stds)
+    eps = 1e-6
+    if stds_per_sample_b is not None:
+        stds_per_sample_b = th.clamp(stds_per_sample_b, min=eps)
+    diffs_x_y_a = sorted_samples_a - sorted_samples_cluster_a
+    diffs_x_y_b = sorted_samples_b - sorted_samples_cluster_b
+    diffs_x_x = sorted_samples_a - sorted_samples_b
+    diffs_y_y = sorted_samples_cluster_a - sorted_samples_cluster_b
+
+
+    if normalize_by_stds:
+        diffs_x_y_a = diffs_x_y_a / stds_per_sample_a
+        diffs_x_y_b = diffs_x_y_b / stds_per_sample_b
+        diffs_y_y = diffs_y_y / ((stds_per_sample_a + stds_per_sample_b) / 2)
+
+    if abs_or_square == 'abs':
+        diffs_x_x = th.mean(th.abs(diffs_x_x))
+        if backprop_to_cluster_weights:
+            diffs_x_y_a = th.mean(th.abs(diffs_x_y_a) * diff_weights_a)
+            diffs_x_y_b = th.mean(th.abs(diffs_x_y_b) * diff_weights_b)
+            diffs_y_y = th.mean(th.abs(diffs_y_y) * ((diff_weights_a + diff_weights_b) / 2))
+        else:
+            diffs_x_y_a = th.mean(th.abs(diffs_x_y_a))
+            diffs_x_y_b = th.mean(th.abs(diffs_x_y_b))
+            diffs_y_y = th.mean(th.abs(diffs_y_y))
+    else:
+        assert abs_or_square == 'square'
+        diffs_x_x = th.mean((diffs_x_x * diffs_x_x))
+        if backprop_to_cluster_weights:
+            diffs_x_y_a = th.mean((diffs_x_y_a * diffs_x_y_a) * diff_weights_a)
+            diffs_x_y_b = th.mean((diffs_x_y_b * diffs_x_y_b) * diff_weights_b)
+            diffs_y_y = th.mean((diffs_y_y * diffs_y_y) * ((diff_weights_a + diff_weights_b) / 2))
+        else:
+            diffs_x_y_a = th.mean((diffs_x_y_a * diffs_x_y_a))
+            diffs_x_y_b = th.mean((diffs_x_y_b * diffs_x_y_b))
+            diffs_y_y = th.mean((diffs_y_y * diffs_y_y))
+    #sample_loss = 2 * diffs_x_y_a - diffs_x_x - diffs_y_y
+    sample_loss = diffs_x_y_b + diffs_x_y_a - diffs_x_x - diffs_y_y
+    sample_loss = sample_loss / diffs_x_x
+    return sample_loss
+
