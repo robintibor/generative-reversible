@@ -23,24 +23,34 @@ class ReversibleBlock(th.nn.Module):
 
 
 class SubsampleSplitter(th.nn.Module):
-    def __init__(self, stride):
+    def __init__(self, stride, chunk_chans_first=True):
         super(SubsampleSplitter, self).__init__()
         if not hasattr(stride, '__len__'):
             stride = (stride, stride)
         self.stride = stride
+        self.chunk_chans_first = chunk_chans_first
 
     def forward(self, x):
+        # Chunk chans first to ensure that each of the two streams in the
+        # reversible network will see a subsampled version of the whole input
+        # (in case the preceding blocks would not alter the input)
+        # and not one half of the input
         new_x = []
-        for i_stride in range(self.stride[0]):
-            for j_stride in range(self.stride[1]):
-                new_x.append(
-                    x[:, :, i_stride::self.stride[0], j_stride::self.stride[1]])
+        if self.chunk_chans_first:
+            xs = th.chunk(x, 2, dim=1)
+        else:
+            xs = [x]
+        for one_x in xs:
+            for i_stride in range(self.stride[0]):
+                for j_stride in range(self.stride[1]):
+                    new_x.append(
+                        one_x[:, :, i_stride::self.stride[0], j_stride::self.stride[1]])
         new_x = th.cat(new_x, dim=1)
         return new_x
 
 
 def invert(feature_model, features):
-    if feature_model.__class__.__name__ == 'ReversibleBlock':
+    if feature_model.__class__.__name__ == 'ReversibleBlock' or feature_model.__class__.__name__  == 'SubsampleSplitter':
         feature_model = nn.Sequential(feature_model, )
     for module in reversed(list(feature_model.children())):
         if module.__class__.__name__ == 'ReversibleBlock':
@@ -54,27 +64,37 @@ def invert(feature_model, features):
             x2 = y1 - module.F(x1)
             features = th.cat((x1, x2), dim=1)
         if module.__class__.__name__ == 'SubsampleSplitter':
+            # after splitting the input into two along channel dimension if possible
             # for i_stride in range(self.stride):
             #    for j_stride in range(self.stride):
-            #        new_x.append(x[:,:,i_stride::self.stride, j_stride::self.stride])
-            previous_features = th.zeros(features.size()[0],
-                         features.size()[1] // (module.stride[0] * module.stride[1]),
-                         features.size()[2] * module.stride[0],
-                         features.size()[3] * module.stride[1])
-            if y1.is_cuda:
-                previous_features = previous_features.cuda()
-            previous_features = th.autograd.Variable(previous_features)
+            #        new_x.append(one_x[:,:,i_stride::self.stride, j_stride::self.stride])
+            n_all_chans_before = features.size()[1] // (module.stride[0] * module.stride[1])
+            # if ther was only one chan before, chunk had no effect
+            if module.chunk_chans_first and (n_all_chans_before > 1):
+                chan_features = th.chunk(features, 2, dim=1)
+            else:
+                chan_features = [features]
+            all_previous_features = []
+            for one_chan_features in chan_features:
+                previous_features = th.zeros(one_chan_features.size()[0],
+                             one_chan_features.size()[1] // (module.stride[0] * module.stride[1]),
+                             one_chan_features.size()[2] * module.stride[0],
+                             one_chan_features.size()[3] * module.stride[1])
+                if features.is_cuda:
+                    previous_features = previous_features.cuda()
+                previous_features = th.autograd.Variable(previous_features)
 
-            n_chans_before = previous_features.size()[1]
-            cur_chan = 0
-            for i_stride in range(module.stride[0]):
-                for j_stride in range(module.stride[1]):
-                    previous_features[:, :, i_stride::module.stride[0],
-                    j_stride::module.stride[1]] = (
-                        features[:,
-                        cur_chan * n_chans_before:cur_chan * n_chans_before + n_chans_before])
-                    cur_chan += 1
-            features = previous_features
+                n_chans_before = previous_features.size()[1]
+                cur_chan = 0
+                for i_stride in range(module.stride[0]):
+                    for j_stride in range(module.stride[1]):
+                        previous_features[:, :, i_stride::module.stride[0],
+                        j_stride::module.stride[1]] = (
+                            one_chan_features[:,
+                            cur_chan * n_chans_before:cur_chan * n_chans_before + n_chans_before])
+                        cur_chan += 1
+                all_previous_features.append(previous_features)
+            features = th.cat(all_previous_features, dim=1)
     return features
 
 
@@ -350,6 +370,35 @@ def analytical_l2_cdf_and_sample_transport_loss(
             normalize_by_stds=normalize_by_stds)
     return cdf_loss, sample_loss
 
+def sample_transport_loss(
+        samples, means_per_dim, stds_per_dim, weights_per_cluster, abs_or_square,
+        n_interpolation_samples,
+        cuda=False, directions=None, backprop_sample_loss_to_cluster_weights=True,
+        normalize_by_stds=True, energy_sample_loss=False):
+    # common
+    if directions is None:
+        directions = sample_directions(samples.size()[1], True, cuda=cuda)
+    else:
+        directions = norm_and_var_directions(directions)
+
+    projected_samples = th.mm(samples, directions.t())
+    sorted_samples, _ = th.sort(projected_samples, dim=0)
+    if energy_sample_loss:
+        sample_loss = sampled_energy_transport_loss(
+            projected_samples, directions,
+            means_per_dim, stds_per_dim, weights_per_cluster,
+            abs_or_square,
+            backprop_to_cluster_weights=backprop_sample_loss_to_cluster_weights,
+            normalize_by_stds=normalize_by_stds)
+    else:
+        sample_loss =  sampled_transport_diffs_interpolate_sorted_part(
+            sorted_samples, directions, means_per_dim,
+            stds_per_dim, weights_per_cluster, n_interpolation_samples,
+            abs_or_square=abs_or_square,
+            backprop_to_cluster_weights=backprop_sample_loss_to_cluster_weights,
+            normalize_by_stds=normalize_by_stds)
+    return sample_loss
+
 def analytical_l2_cdf_loss(
         samples, means_per_dim, stds_per_dim, weights_per_cluster,
         cuda=False, directions=None, ):
@@ -418,6 +467,7 @@ def sampled_transport_diffs_interpolate_sorted_part(
         else:
             sample_loss = th.sqrt(th.mean(diffs * diffs))
     return sample_loss
+
 
 def sampled_energy_transport_loss(
         projected_samples, directions,
