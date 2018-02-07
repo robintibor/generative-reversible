@@ -278,40 +278,39 @@ def sampled_energy_transport_loss(
     if stds_per_sample_b is not None:
         stds_per_sample_b = th.clamp(stds_per_sample_b, min=eps)
     diffs_x_y_a = sorted_samples_a - sorted_samples_cluster_a
-    diffs_x_y_b = sorted_samples_b - sorted_samples_cluster_b
+    #diffs_x_y_b = sorted_samples_b - sorted_samples_cluster_b
     diffs_x_x = sorted_samples_a - sorted_samples_b
     diffs_y_y = sorted_samples_cluster_a - sorted_samples_cluster_b
 
 
     if normalize_by_stds:
         diffs_x_y_a = diffs_x_y_a / stds_per_sample_a
-        diffs_x_y_b = diffs_x_y_b / stds_per_sample_b
+        #diffs_x_y_b = diffs_x_y_b / stds_per_sample_b
         diffs_y_y = diffs_y_y / ((stds_per_sample_a + stds_per_sample_b) / 2)
 
     if abs_or_square == 'abs':
         diffs_x_x = th.mean(th.abs(diffs_x_x))
         if backprop_to_cluster_weights:
             diffs_x_y_a = th.mean(th.abs(diffs_x_y_a) * diff_weights_a)
-            diffs_x_y_b = th.mean(th.abs(diffs_x_y_b) * diff_weights_b)
+            #diffs_x_y_b = th.mean(th.abs(diffs_x_y_b) * diff_weights_b)
             diffs_y_y = th.mean(th.abs(diffs_y_y) * ((diff_weights_a + diff_weights_b) / 2))
         else:
             diffs_x_y_a = th.mean(th.abs(diffs_x_y_a))
-            diffs_x_y_b = th.mean(th.abs(diffs_x_y_b))
+            #diffs_x_y_b = th.mean(th.abs(diffs_x_y_b))
             diffs_y_y = th.mean(th.abs(diffs_y_y))
     else:
         assert abs_or_square == 'square'
         diffs_x_x = th.mean((diffs_x_x * diffs_x_x))
         if backprop_to_cluster_weights:
             diffs_x_y_a = th.mean((diffs_x_y_a * diffs_x_y_a) * diff_weights_a)
-            diffs_x_y_b = th.mean((diffs_x_y_b * diffs_x_y_b) * diff_weights_b)
+            #diffs_x_y_b = th.mean((diffs_x_y_b * diffs_x_y_b) * diff_weights_b)
             diffs_y_y = th.mean((diffs_y_y * diffs_y_y) * ((diff_weights_a + diff_weights_b) / 2))
         else:
             diffs_x_y_a = th.mean((diffs_x_y_a * diffs_x_y_a))
-            diffs_x_y_b = th.mean((diffs_x_y_b * diffs_x_y_b))
+            #diffs_x_y_b = th.mean((diffs_x_y_b * diffs_x_y_b))
             diffs_y_y = th.mean((diffs_y_y * diffs_y_y))
-    #sample_loss = 2 * diffs_x_y_a - diffs_x_x - diffs_y_y
-    sample_loss = diffs_x_y_b + diffs_x_y_a - diffs_x_x - diffs_y_y
-    sample_loss = sample_loss / diffs_x_x
+    sample_loss = 2 * diffs_x_y_a - diffs_x_x - diffs_y_y
+    #sample_loss = diffs_x_y_b + diffs_x_y_a - diffs_x_x - diffs_y_y
     return sample_loss
 
 
@@ -455,6 +454,22 @@ def ensure_cuda(v):
     return v
 
 
+def get_exact_size_batches(n_trials, rng, batch_size):
+    i_trials = np.arange(n_trials)
+    rng.shuffle(i_trials)
+    i_trial = 0
+    batches = []
+    for i_trial in range(0, n_trials-batch_size, batch_size):
+        batches.append(i_trials[i_trial: i_trial+batch_size])
+    i_trial = i_trial + batch_size
+
+    last_batch = i_trials[i_trial:]
+    n_remain = batch_size - len(last_batch)
+    last_batch = np.concatenate((last_batch, i_trials[:n_remain]))
+    batches.append(last_batch)
+    return batches
+
+
 def train_epoch(
         inputs, batch_size, rng,
         feature_model,
@@ -462,13 +477,18 @@ def train_epoch(
         directions_adv,
         optimizer, optimizer_adv,
         std_l1=0.5, mean_l1=0.01, weight_l1=0,
-        backprop_sample_loss_to_cluster_weights=False):
+        backprop_sample_loss_to_cluster_weights=False,
+        energy_based=False):
     feature_model.train()
     all_trans_losses = []
     all_l1_losses = []
     all_losses = []
-    for i_examples in get_balanced_batches(len(inputs), rng, shuffle=True,
-                                           batch_size=batch_size):
+    #if energy_based:
+    examples_per_batch = get_exact_size_batches(len(inputs), rng, batch_size)
+    #else:
+    #    examples_per_batch = get_balanced_batches(len(inputs), rng, shuffle=True,
+    #                                       batch_size=batch_size)
+    for i_examples in examples_per_batch:
         batch_X = inputs[th.LongTensor(i_examples)]
         trans_loss, threshold_l1_penalty, total_loss = train_on_batch(
             batch_X, feature_model,
@@ -476,7 +496,8 @@ def train_epoch(
             directions_adv,
             optimizer, optimizer_adv,
             std_l1=std_l1, mean_l1=mean_l1, weight_l1=weight_l1,
-            backprop_sample_loss_to_cluster_weights=backprop_sample_loss_to_cluster_weights)
+            backprop_sample_loss_to_cluster_weights=backprop_sample_loss_to_cluster_weights,
+            energy_based=energy_based)
         all_trans_losses.append(var_to_np(trans_loss))
         all_l1_losses.append(var_to_np(threshold_l1_penalty))
         all_losses.append(var_to_np(total_loss))
@@ -490,7 +511,8 @@ def train_on_batch(
         directions_adv,
             optimizer, optimizer_adv,
         std_l1, mean_l1, weight_l1,
-        backprop_sample_loss_to_cluster_weights):
+        backprop_sample_loss_to_cluster_weights,
+        energy_based):
     batch_outs = feature_model(batch_X).squeeze()
     trans_losses = []
     for a_dir in [None, None, norm_and_var_directions(directions_adv)]:
@@ -499,7 +521,7 @@ def train_on_batch(
             weights_per_cluster / th.sum(weights_per_cluster),
             'square', n_interpolation_samples=len(batch_outs) * 2,
             backprop_sample_loss_to_cluster_weights=backprop_sample_loss_to_cluster_weights,
-            normalize_by_stds=False, energy_sample_loss=False,
+            normalize_by_stds=False, energy_sample_loss=energy_based,
             directions=a_dir)
         trans_losses.append(trans_loss)
     trans_loss = th.sum(th.cat(trans_losses))
@@ -518,6 +540,22 @@ def train_on_batch(
     weights_per_cluster.data.div_(th.sum(weights_per_cluster.data))
     stds_per_dim.data.clamp_(min=1e-4)
     return trans_loss, threshold_l1_penalty, total_loss
+
+def eval_inputs(batch_X, feature_model,
+        means_per_dim, stds_per_dim, weights_per_cluster,
+        directions_adv,):
+    all_outs = feature_model(batch_X).squeeze()
+    trans_losses = []
+    for a_dir in [None, None, norm_and_var_directions(directions_adv)]:
+        trans_loss = sample_transport_loss(
+            all_outs, means_per_dim, stds_per_dim,
+            weights_per_cluster / th.sum(weights_per_cluster),
+            'square', n_interpolation_samples=len(all_outs) * 2,
+            backprop_sample_loss_to_cluster_weights=False,
+            normalize_by_stds=False, energy_sample_loss=False,
+            directions=a_dir)
+        trans_losses.append(trans_loss)
+    return var_to_np(th.cat(trans_losses))
 
 
 ## Earlier stuff for Cramer distance/L2-distance of cumulative distribution functions
