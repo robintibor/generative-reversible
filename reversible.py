@@ -110,7 +110,7 @@ def get_inputs_from_reverted_samples(n_inputs, means_per_dim, stds_per_dim,
     gauss_samples = sample_mixture_gaussian(sizes, means_per_dim, stds_per_dim)
     rec_var = invert(feature_model, gauss_samples.unsqueeze(2).unsqueeze(3))
     rec_examples = var_to_np(rec_var).squeeze()
-    return rec_examples
+    return rec_examples, gauss_samples
 
 
 def weights_init(module, conv_weight_init_fn):
