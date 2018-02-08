@@ -185,6 +185,37 @@ def sizes_from_weights(size, weights, ):
     return sizes
 
 
+def log_gaussian_pdf_per_cluster(X, means_per_dim, stds_per_dim, eps=1e-6):
+    ## Tested with comparison to scipy:
+    # i_cluster = 2
+    # cov_mat = th.eye(32) * stds_per_dim[i_cluster].data * stds_per_dim[
+    #     i_cluster].data
+    #
+    # dist = scipy.stats.multivariate_normal(var_to_np(means_per_dim[i_cluster]),
+    #                                        cov_mat.cpu().numpy())
+    #
+    # dist.logpdf(var_to_np(X[1]))
+    # log (1/sqrt(2*pi)
+    subtractors = (-th.log(2 * th.FloatTensor([np.pi])) / 2)
+    subtractors, means_per_dim = ensure_on_same_device(
+        subtractors, means_per_dim)
+    subtractors = th.autograd.Variable(subtractors)
+    subtractors = subtractors * th.log(stds_per_dim + eps)
+    # subtractors are clusters x dims
+    # For some reason, this computation had bigger difference to scipy?
+    # subtractors = subtractors * th.sum(th.log(stds_per_dim + eps))
+
+    demeaned_X = X.unsqueeze(2) - means_per_dim.t().unsqueeze(0)
+    squared_std = stds_per_dim * stds_per_dim
+    # demeaned_X are examples x dims x clusters
+    log_pdf_per_dim_per_cluster = (
+        -(demeaned_X * demeaned_X) / (2 * squared_std.t().unsqueeze(0)))
+    log_pdf_per_dim_per_cluster = log_pdf_per_dim_per_cluster - subtractors.t().unsqueeze(
+        0)
+
+    log_pdf_per_cluster = th.sum(log_pdf_per_dim_per_cluster, dim=1)
+    return log_pdf_per_cluster
+
 
 ## Transport/Wasserstein loss
 
@@ -541,9 +572,10 @@ def train_on_batch(
     stds_per_dim.data.clamp_(min=1e-4)
     return trans_loss, threshold_l1_penalty, total_loss
 
+
 def eval_inputs(batch_X, feature_model,
         means_per_dim, stds_per_dim, weights_per_cluster,
-        directions_adv,):
+        directions_adv, energy_based=False):
     all_outs = feature_model(batch_X).squeeze()
     trans_losses = []
     for a_dir in [None, None, norm_and_var_directions(directions_adv)]:
@@ -552,8 +584,8 @@ def eval_inputs(batch_X, feature_model,
             weights_per_cluster / th.sum(weights_per_cluster),
             'square', n_interpolation_samples=len(all_outs) * 2,
             backprop_sample_loss_to_cluster_weights=False,
-            normalize_by_stds=False, energy_sample_loss=False,
-            directions=a_dir)
+            normalize_by_stds=False,
+            directions=a_dir, energy_sample_loss=energy_based)
         trans_losses.append(trans_loss)
     return var_to_np(th.cat(trans_losses))
 
