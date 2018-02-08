@@ -102,6 +102,22 @@ def invert(feature_model, features):
     return features
 
 
+class GaussianMixtureDensities(th.nn.Module):
+    def __init__(self, means_per_dim, stds_per_dim, weights_per_cluster):
+        self.means_per_dim = means_per_dim
+        self.stds_per_dim = stds_per_dim
+        self.weights_per_cluster = weights_per_cluster
+
+        super(GaussianMixtureDensities, self).__init__()
+
+    def forward(self, x):
+        log_pdf_per_cluster = log_gaussian_pdf_per_cluster(
+            x, self.means_per_dim, self.stds_per_dim)
+        log_pdf_per_cluster = log_pdf_per_cluster + th.log(
+            self.weights_per_cluster.unsqueeze(0))
+        return log_pdf_per_cluster
+
+
 def get_inputs_from_reverted_samples(n_inputs, means_per_dim, stds_per_dim,
                                      weights_per_cluster,
                                      feature_model):
@@ -196,24 +212,21 @@ def log_gaussian_pdf_per_cluster(X, means_per_dim, stds_per_dim, eps=1e-6):
     #
     # dist.logpdf(var_to_np(X[1]))
     # log (1/sqrt(2*pi)
-    subtractors = (-th.log(2 * th.FloatTensor([np.pi])) / 2)
+    subtractors = th.FloatTensor([np.log(2 * np.pi) / 2])
     subtractors, means_per_dim = ensure_on_same_device(
         subtractors, means_per_dim)
     subtractors = th.autograd.Variable(subtractors)
-    subtractors = subtractors * th.log(stds_per_dim + eps)
-    # subtractors are clusters x dims
-    # For some reason, this computation had bigger difference to scipy?
-    # subtractors = subtractors * th.sum(th.log(stds_per_dim + eps))
+    subtractors = (subtractors * stds_per_dim.size()[1]) + th.sum(th.log(stds_per_dim + eps), dim=1)
+    # now subtractors are per cluster
 
     demeaned_X = X.unsqueeze(2) - means_per_dim.t().unsqueeze(0)
     squared_std = stds_per_dim * stds_per_dim
     # demeaned_X are examples x dims x clusters
     log_pdf_per_dim_per_cluster = (
         -(demeaned_X * demeaned_X) / (2 * squared_std.t().unsqueeze(0)))
-    log_pdf_per_dim_per_cluster = log_pdf_per_dim_per_cluster - subtractors.t().unsqueeze(
-        0)
-
-    log_pdf_per_cluster = th.sum(log_pdf_per_dim_per_cluster, dim=1)
+    # log_pdf_per_dim_per_cluster are examples x dims x clusters
+    log_pdf_per_dim_per_cluster = th.sum(log_pdf_per_dim_per_cluster, dim=1)
+    log_pdf_per_cluster = log_pdf_per_dim_per_cluster - subtractors.unsqueeze(0)
     return log_pdf_per_cluster
 
 
@@ -509,10 +522,11 @@ def train_epoch(
         optimizer, optimizer_adv,
         std_l1=0.5, mean_l1=0.01, weight_l1=0,
         backprop_sample_loss_to_cluster_weights=False,
-        energy_based=False):
+        energy_based=False, clf=None, targets=None):
     feature_model.train()
     all_trans_losses = []
     all_l1_losses = []
+    all_target_losses = []
     all_losses = []
     #if energy_based:
     examples_per_batch = get_exact_size_batches(len(inputs), rng, batch_size)
@@ -521,19 +535,21 @@ def train_epoch(
     #                                       batch_size=batch_size)
     for i_examples in examples_per_batch:
         batch_X = inputs[th.LongTensor(i_examples)]
-        trans_loss, threshold_l1_penalty, total_loss = train_on_batch(
+        batch_y = targets[th.LongTensor(i_examples)]
+        trans_loss, threshold_l1_penalty, target_loss, total_loss = train_on_batch(
             batch_X, feature_model,
             means_per_dim, stds_per_dim, weights_per_cluster,
             directions_adv,
             optimizer, optimizer_adv,
             std_l1=std_l1, mean_l1=mean_l1, weight_l1=weight_l1,
             backprop_sample_loss_to_cluster_weights=backprop_sample_loss_to_cluster_weights,
-            energy_based=energy_based)
+            energy_based=energy_based, clf=clf, targets=batch_y)
         all_trans_losses.append(var_to_np(trans_loss))
         all_l1_losses.append(var_to_np(threshold_l1_penalty))
+        all_target_losses.append(var_to_np(target_loss))
         all_losses.append(var_to_np(total_loss))
 
-    return all_trans_losses, all_l1_losses, all_losses
+    return all_trans_losses, all_l1_losses, all_target_losses, all_losses
 
 
 def train_on_batch(
@@ -543,7 +559,7 @@ def train_on_batch(
             optimizer, optimizer_adv,
         std_l1, mean_l1, weight_l1,
         backprop_sample_loss_to_cluster_weights,
-        energy_based):
+        energy_based, clf, targets):
     batch_outs = feature_model(batch_X).squeeze()
     trans_losses = []
     for a_dir in [None, None, norm_and_var_directions(directions_adv)]:
@@ -556,10 +572,18 @@ def train_on_batch(
             directions=a_dir)
         trans_losses.append(trans_loss)
     trans_loss = th.sum(th.cat(trans_losses))
+
     threshold_l1_penalty = ((th.mean(th.abs(stds_per_dim))) * std_l1 +
                             th.mean(th.abs(weights_per_cluster)) * weight_l1 +
                             th.mean(th.abs(means_per_dim)) * mean_l1)
-    total_loss = trans_loss + threshold_l1_penalty
+    if clf is not None:
+        assert targets is not None
+        preds = clf(batch_outs)
+        target_loss = th.nn.functional.nll_loss(preds, targets)
+    else:
+        target_loss = 0
+
+    total_loss = trans_loss + threshold_l1_penalty + target_loss
     optimizer.zero_grad()
     optimizer_adv.zero_grad()
     total_loss.backward()
@@ -570,7 +594,7 @@ def train_on_batch(
     weights_per_cluster.data.clamp_(min=0)
     weights_per_cluster.data.div_(th.sum(weights_per_cluster.data))
     stds_per_dim.data.clamp_(min=1e-4)
-    return trans_loss, threshold_l1_penalty, total_loss
+    return trans_loss, threshold_l1_penalty, target_loss, total_loss
 
 
 def eval_inputs(batch_X, feature_model,
