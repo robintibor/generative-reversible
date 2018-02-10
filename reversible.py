@@ -118,6 +118,60 @@ class GaussianMixtureDensities(th.nn.Module):
         return log_pdf_per_cluster
 
 
+class GaussianMixtureDistances(th.nn.Module):
+    def __init__(self, means_per_dim, stds_per_dim, weights_per_cluster):
+        self.means_per_dim = means_per_dim
+        self.stds_per_dim = stds_per_dim
+        self.weights_per_cluster = weights_per_cluster
+
+        super(GaussianMixtureDistances, self).__init__()
+
+    def forward(self, x):
+        samples_per_cluster = []
+        for i_cluster in range(self.means_per_dim.size()[0]):
+            sizes = [0] * self.means_per_dim.size()[0]
+            sizes[i_cluster] = len(x) * 2
+            this_samples = sample_mixture_gaussian(
+                sizes, self.means_per_dim, self.stds_per_dim)
+            samples_per_cluster.append(this_samples)
+
+        samples_per_cluster = th.stack(samples_per_cluster)
+
+        diffs = samples_per_cluster.unsqueeze(3) - x.t().unsqueeze(0).unsqueeze(
+            1)
+        # cluster x samples x dims x examples
+        avg_diff = th.mean(th.mean(diffs * diffs, dim=2), dim=1).t()
+        return -avg_diff
+        # old version:
+        #eps = 1e-6
+        #similarity = 1 / (avg_diff + eps)
+        #similarity = similarity * self.weights_per_cluster.unsqueeze(0)
+        #return similarity
+
+
+class GaussianMeanDistances(th.nn.Module):
+    def __init__(self, means_per_dim, stds_per_dim, weights_per_cluster,
+                 normalize_by_std=False):
+        self.means_per_dim = means_per_dim
+        self.stds_per_dim = stds_per_dim
+        self.weights_per_cluster = weights_per_cluster
+        self.normalize_by_std = normalize_by_std
+
+        super(GaussianMeanDistances, self).__init__()
+
+    def forward(self, x):
+        # x is examples x dims
+        diffs_to_mean = x.unsqueeze(2) - self.means_per_dim.t().unsqueeze(0)
+        # now examples x dims x clusters
+        eps = 1e-6
+        if self.normalize_by_std:
+            diffs_to_mean = diffs_to_mean / (self.stds_per_dim.t().unsqueeze(0) + eps)
+        avg_squared_diffs = th.mean(diffs_to_mean * diffs_to_mean, dim=1)
+        return -avg_squared_diffs
+
+
+
+
 def get_inputs_from_reverted_samples(n_inputs, means_per_dim, stds_per_dim,
                                      weights_per_cluster,
                                      feature_model):
@@ -231,6 +285,97 @@ def log_gaussian_pdf_per_cluster(X, means_per_dim, stds_per_dim, eps=1e-6):
 
 
 ## Transport/Wasserstein loss
+
+import itertools
+
+
+def pairwise_projection_loss(X, targets, means_per_dim, stds_per_dim):
+    outs_per_class_pair, midpoints, stds_per_pair = pairwise_projections(X, means_per_dim, stds_per_dim)
+
+
+    losses = th.autograd.Variable(th.zeros(len(outs_per_class_pair)))
+    for i_cluster in range(len(means_per_dim)):
+        relevant_outs = outs_per_class_pair[:,i_cluster,:]
+        #relevant_outs = th.cat((relevant_outs[:,:i_cluster], relevant_outs[:,i_cluster+1:]), dim=1)
+        n_elems = len(th.nonzero(targets==i_cluster))
+
+        relevant_outs = relevant_outs[(targets==i_cluster).unsqueeze(1)].resize(
+            n_elems, outs_per_class_pair.size()[2])
+
+        # now examples x clusters
+        # shows lengths of examples projected on arrows from wanted cluster to other clusters
+        # -> the smaller the better, negative indicates already "behind" the wanted mean
+        # loss: if (looking towards unwanted cluster) in front of wanted mean,
+        # take squared (difference to wanted mean + mean variance for both), only punish if point
+        # + variance is further away from mean than midpoint
+        # or midpoint times some scalar (0.25)
+        #
+        relevant_stds = stds_per_pair[i_cluster]
+        relevant_midpoints = midpoints[i_cluster]
+        with_stds = relevant_outs + relevant_stds.unsqueeze(0)
+
+        scaled_outs = with_stds / (relevant_midpoints.unsqueeze(0) + 1e-6)
+        # scaled outs still examples x clusters
+        parts = []
+        if i_cluster > 0:
+            parts.append(scaled_outs[:,:i_cluster])
+        if i_cluster < scaled_outs.size()[1]:
+            parts.append(scaled_outs[:,i_cluster:])
+        scaled_outs = th.cat(parts, dim=1)
+        outs_to_be_penalized = (scaled_outs > 0.25).type(th.FloatTensor)
+        this_losses = th.sum(outs_to_be_penalized   * (scaled_outs * scaled_outs), dim=1)
+        losses[(targets==i_cluster)] = this_losses
+    return losses
+
+
+def pairwise_projections(X, means_per_dim, stds_per_dim):
+    diff_between_clusters = means_per_dim.unsqueeze(
+        0) - means_per_dim.unsqueeze(1)
+    # clusters x clusters x dims
+    # outs ar examples x dims
+    outs_per_class_pair = th.sum(
+        X.unsqueeze(1).unsqueeze(2) * diff_between_clusters.unsqueeze(0), dim=3)
+    # now examples x cluster x cluster
+    mean_between_clusters = (means_per_dim.unsqueeze(
+        0) + means_per_dim.unsqueeze(1)) / 2
+    # cluster x cluster x dims
+    midpoints = th.sum(mean_between_clusters * diff_between_clusters, dim=2)
+
+    first_mean_projected = th.sum(
+        means_per_dim.unsqueeze(1) * diff_between_clusters, dim=2)
+    # clusters x clusters
+    outs_per_class_pair = outs_per_class_pair - first_mean_projected.unsqueeze(
+        0)
+    midpoints = midpoints - first_mean_projected
+
+    stds_per_pair = th.autograd.Variable(
+        th.zeros(len(means_per_dim), len(means_per_dim)))
+
+    for i_c_a, i_c_b in itertools.product(range(len(means_per_dim)),
+                                          range(len(means_per_dim))):
+        if i_c_a == i_c_b:
+            continue
+            # Somehow otherwise get nans in gradients although
+            # not clear to me why...
+        diff_vector = diff_between_clusters[i_c_a, i_c_b]
+        relevant_means = th.stack((means_per_dim[i_c_a], means_per_dim[i_c_b]),
+                                  dim=0)
+        relevant_stds = th.stack((stds_per_dim[i_c_a], stds_per_dim[i_c_b]),
+                                 dim=0)
+        _, pair_std = transform_gaussian_by_dirs(relevant_means, relevant_stds,
+                                                 diff_vector.unsqueeze(0))
+        stds_per_pair[i_c_a, i_c_b] = th.sum(pair_std)
+
+    return outs_per_class_pair, midpoints, stds_per_pair
+
+
+def pairwise_projection_score(X, means_per_dim, stds_per_dim):
+    outs_per_class_pair, midpoints, stds_per_pair = pairwise_projections(X, means_per_dim, stds_per_dim)
+    with_stds = outs_per_class_pair + stds_per_pair.unsqueeze(0)
+    scaled_outs = with_stds / (midpoints.unsqueeze(0) + 1e-6)
+    scores = -th.sum(scaled_outs * scaled_outs, dim=2)
+    return scores
+
 
 def sample_transport_loss(
         samples, means_per_dim, stds_per_dim, weights_per_cluster, abs_or_square,
@@ -522,7 +667,9 @@ def train_epoch(
         optimizer, optimizer_adv,
         std_l1=0.5, mean_l1=0.01, weight_l1=0,
         backprop_sample_loss_to_cluster_weights=False,
-        energy_based=False, clf=None, targets=None):
+        normalize_by_std=False,
+        energy_based=False, clf=None, targets=None,
+        loss_function=None):
     feature_model.train()
     all_trans_losses = []
     all_l1_losses = []
@@ -534,8 +681,12 @@ def train_epoch(
     #    examples_per_batch = get_balanced_batches(len(inputs), rng, shuffle=True,
     #                                       batch_size=batch_size)
     for i_examples in examples_per_batch:
+        #print("weights_per_cluster epoch", weights_per_cluster)
         batch_X = inputs[th.LongTensor(i_examples)]
-        batch_y = targets[th.LongTensor(i_examples)]
+        if targets is not None:
+            batch_y = targets[th.LongTensor(i_examples)]
+        else:
+            batch_y = None
         trans_loss, threshold_l1_penalty, target_loss, total_loss = train_on_batch(
             batch_X, feature_model,
             means_per_dim, stds_per_dim, weights_per_cluster,
@@ -543,12 +694,16 @@ def train_epoch(
             optimizer, optimizer_adv,
             std_l1=std_l1, mean_l1=mean_l1, weight_l1=weight_l1,
             backprop_sample_loss_to_cluster_weights=backprop_sample_loss_to_cluster_weights,
-            energy_based=energy_based, clf=clf, targets=batch_y)
+            normalize_by_std=normalize_by_std,
+            energy_based=energy_based, clf=clf, targets=batch_y,
+            loss_function=loss_function)
         all_trans_losses.append(var_to_np(trans_loss))
         all_l1_losses.append(var_to_np(threshold_l1_penalty))
-        all_target_losses.append(var_to_np(target_loss))
+        if targets is not None:
+            all_target_losses.append(var_to_np(target_loss))
+        else:
+            all_target_losses.append(0)
         all_losses.append(var_to_np(total_loss))
-
     return all_trans_losses, all_l1_losses, all_target_losses, all_losses
 
 
@@ -559,7 +714,8 @@ def train_on_batch(
             optimizer, optimizer_adv,
         std_l1, mean_l1, weight_l1,
         backprop_sample_loss_to_cluster_weights,
-        energy_based, clf, targets):
+        normalize_by_std,
+        energy_based, clf, targets, loss_function):
     batch_outs = feature_model(batch_X).squeeze()
     trans_losses = []
     for a_dir in [None, None, norm_and_var_directions(directions_adv)]:
@@ -568,7 +724,7 @@ def train_on_batch(
             weights_per_cluster / th.sum(weights_per_cluster),
             'square', n_interpolation_samples=len(batch_outs) * 2,
             backprop_sample_loss_to_cluster_weights=backprop_sample_loss_to_cluster_weights,
-            normalize_by_stds=False, energy_sample_loss=energy_based,
+            normalize_by_stds=normalize_by_std, energy_sample_loss=energy_based,
             directions=a_dir)
         trans_losses.append(trans_loss)
     trans_loss = th.sum(th.cat(trans_losses))
@@ -576,10 +732,12 @@ def train_on_batch(
     threshold_l1_penalty = ((th.mean(th.abs(stds_per_dim))) * std_l1 +
                             th.mean(th.abs(weights_per_cluster)) * weight_l1 +
                             th.mean(th.abs(means_per_dim)) * mean_l1)
-    if clf is not None:
-        assert targets is not None
-        preds = clf(batch_outs)
-        target_loss = th.nn.functional.nll_loss(preds, targets)
+    if targets is not None:
+        if clf is not None:
+            preds = clf(batch_outs)
+        else:
+            preds = batch_outs
+        target_loss = loss_function(preds, targets)
     else:
         target_loss = 0
 
@@ -594,6 +752,7 @@ def train_on_batch(
     weights_per_cluster.data.clamp_(min=0)
     weights_per_cluster.data.div_(th.sum(weights_per_cluster.data))
     stds_per_dim.data.clamp_(min=1e-4)
+
     return trans_loss, threshold_l1_penalty, target_loss, total_loss
 
 
