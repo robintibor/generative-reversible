@@ -289,7 +289,8 @@ def log_gaussian_pdf_per_cluster(X, means_per_dim, stds_per_dim, eps=1e-6):
 import itertools
 
 
-def pairwise_projection_loss(X, targets, means_per_dim, stds_per_dim):
+def pairwise_projection_loss(X, targets, means_per_dim, stds_per_dim,
+                             scaled=True):
     outs_per_class_pair, midpoints, stds_per_pair = pairwise_projections(X, means_per_dim, stds_per_dim)
 
 
@@ -312,9 +313,12 @@ def pairwise_projection_loss(X, targets, means_per_dim, stds_per_dim):
         #
         relevant_stds = stds_per_pair[i_cluster]
         relevant_midpoints = midpoints[i_cluster]
+        scaled_stds = relevant_stds / midpoints
         with_stds = relevant_outs + relevant_stds.unsqueeze(0)
-
-        scaled_outs = with_stds / (relevant_midpoints.unsqueeze(0) + 1e-6)
+        if scaled:
+            scaled_outs = relevant_outs / (relevant_midpoints.unsqueeze(0) + 1e-6)
+        else:
+            scaled_outs = relevant_outs
         # scaled outs still examples x clusters
         parts = []
         if i_cluster > 0:
@@ -322,8 +326,12 @@ def pairwise_projection_loss(X, targets, means_per_dim, stds_per_dim):
         if i_cluster < scaled_outs.size()[1]:
             parts.append(scaled_outs[:,i_cluster:])
         scaled_outs = th.cat(parts, dim=1)
-        outs_to_be_penalized = (scaled_outs > 0.25).type(th.FloatTensor)
-        this_losses = th.sum(outs_to_be_penalized   * (scaled_outs * scaled_outs), dim=1)
+        if scaled:
+            outs_to_be_penalized = (scaled_outs > 0.05).type(th.FloatTensor)
+        else:
+            outs_to_be_penalized = (scaled_outs > 0).type(th.FloatTensor)
+        this_losses = th.sum(outs_to_be_penalized * (scaled_outs * scaled_outs),
+                             dim=1)
         losses[(targets==i_cluster)] = this_losses
     return losses
 
