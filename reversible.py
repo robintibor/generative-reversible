@@ -466,9 +466,9 @@ def sampled_transport_diffs_interpolate_sorted_part(
     else:
         assert abs_or_square == 'square'
         if backprop_to_cluster_weights:
-            sample_loss = th.sqrt(th.mean((diffs * diffs) * diff_weights))
+            sample_loss = th.mean(th.sqrt(th.mean((diffs * diffs) * diff_weights, dim=0)))
         else:
-            sample_loss = th.sqrt(th.mean(diffs * diffs))
+            sample_loss = th.mean(th.sqrt(th.mean(diffs * diffs, dim=0)))
     return sample_loss
 
 
@@ -816,7 +816,6 @@ def transport_loss_per_class(
         directions = norm_and_var_directions(directions)
     loss = 0
     for i_cluster in range(len(means_per_dim)):
-
         this_samples = samples[(targets == i_cluster).unsqueeze(1)].view(-1,means_per_dim.size()[1])
         projected_samples = th.mm(this_samples, directions.t())
         transformed_means, transformed_stds = transform_gaussian_by_dirs(
@@ -835,7 +834,8 @@ def transport_loss_per_class(
         all_i_cdfs = i_cdf.unsqueeze(1) * transformed_stds.t() + transformed_means.t()
         diffs = all_i_cdfs - sorted_samples
         # diffs are examples x directions
-        loss = th.sqrt(th.mean(diffs * diffs)) + loss
+        #loss = th.sqrt(th.mean(diffs * diffs)) + loss
+        loss = th.mean(th.sqrt(th.mean(diffs * diffs, dim=0))) + loss
     loss = loss / len(means_per_dim)
     return loss
 
