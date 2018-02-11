@@ -808,35 +808,68 @@ def compute_class_trans_loss(batch_outs,
 
 def transport_loss_per_class(
         samples, means_per_dim, stds_per_dim,
-        targets,
-        cuda=False, directions=None):
+        targets, directions=None):
     if directions is None:
         directions = sample_directions(samples.size()[1], True, cuda=cuda)
     else:
         directions = norm_and_var_directions(directions)
-    loss = 0
-    for i_cluster in range(len(means_per_dim)):
-        this_samples = samples[(targets == i_cluster).unsqueeze(1)].view(-1,means_per_dim.size()[1])
-        projected_samples = th.mm(this_samples, directions.t())
-        transformed_means, transformed_stds = transform_gaussian_by_dirs(
-            means_per_dim[i_cluster:i_cluster+1], stds_per_dim[i_cluster:i_cluster+1],
-                                  directions)
-        #now directions x what?
-        sorted_samples, _ = th.sort(projected_samples, dim=0)
-        n_samples = len(projected_samples)
-        empirical_cdf = th.linspace(1 / (n_samples), 1 - (1 / (n_samples)),
+    n_clusters = len(means_per_dim)
+    projected_samples = th.mm(samples, directions.t())
+    transformed_means, transformed_stds = transform_gaussian_by_dirs(
+        means_per_dim, stds_per_dim, directions)
+    if targets is not None:
+        loss = 0
+        for i_cluster in range(n_clusters):
+            this_samples = projected_samples[
+                (targets == i_cluster).unsqueeze(1)].view(-1, len(directions))
+            # now directions x what?
+            sorted_samples, _ = th.sort(this_samples, dim=0)
+            this_transformed_means = transformed_means[:,
+                                     i_cluster:i_cluster + 1]
+            this_transformed_stds = transformed_stds[:, i_cluster:i_cluster + 1]
+            n_samples = len(this_samples)
+            empirical_cdf = th.linspace(1 / (n_samples), 1 - (1 / (n_samples)),
                                         n_samples).unsqueeze(0)
+            # see https://en.wikipedia.org/wiki/Normal_distribution -> Quantile function
+            i_cdf = th.FloatTensor([np.sqrt(2.0)]) * th.erfinv(
+                2 * empirical_cdf - 1)
+            i_cdf = i_cdf.squeeze()
+            i_cdf = th.autograd.Variable(i_cdf)
+            i_cdf, this_transformed_means = ensure_on_same_device(i_cdf,
+                                                                  this_transformed_means)
+
+            all_i_cdfs = i_cdf.unsqueeze(
+                1) * this_transformed_stds.t() + this_transformed_means.t()
+            diffs = all_i_cdfs - sorted_samples
+            # diffs are examples x directions
+            # loss = th.sqrt(th.mean(diffs * diffs)) + loss
+            loss = th.mean(th.sqrt(th.mean(diffs * diffs, dim=0))) + loss
+        loss = loss / n_clusters
+    else:
+        assert len(samples) % n_clusters == 0
+        samples_per_cluster = []
+        n_samples = len(samples) // n_clusters
+        empirical_cdf = th.linspace(1 / (n_samples), 1 - (1 / (n_samples)),
+                                    n_samples).unsqueeze(0)
         # see https://en.wikipedia.org/wiki/Normal_distribution -> Quantile function
-        i_cdf = th.FloatTensor([np.sqrt(2.0)]) * th.erfinv(2 * empirical_cdf - 1)
+        i_cdf = th.FloatTensor([np.sqrt(2.0)]) * th.erfinv(
+            2 * empirical_cdf - 1)
         i_cdf = i_cdf.squeeze()
         i_cdf = th.autograd.Variable(i_cdf)
-        i_cdf, transformed_means = ensure_on_same_device(i_cdf, transformed_means)
-        all_i_cdfs = i_cdf.unsqueeze(1) * transformed_stds.t() + transformed_means.t()
-        diffs = all_i_cdfs - sorted_samples
-        # diffs are examples x directions
-        #loss = th.sqrt(th.mean(diffs * diffs)) + loss
-        loss = th.mean(th.sqrt(th.mean(diffs * diffs, dim=0))) + loss
-    loss = loss / len(means_per_dim)
+        i_cdf, transformed_means = ensure_on_same_device(i_cdf,
+                                                         transformed_means)
+        for i_cluster in range(n_clusters):
+            this_transformed_means = transformed_means[:,
+                                     i_cluster:i_cluster + 1]
+            this_transformed_stds = transformed_stds[:, i_cluster:i_cluster + 1]
+            all_i_cdfs_this_cluster = i_cdf.unsqueeze(
+                1) * this_transformed_stds.t() + this_transformed_means.t()
+            samples_per_cluster.append(all_i_cdfs_this_cluster)
+        all_i_cdfs = th.cat(samples_per_cluster, dim=0)
+        sorted_cluster_samples, _ = th.sort(all_i_cdfs, dim=0)
+        sorted_samples, _ = th.sort(projected_samples, dim=0)
+        diffs = sorted_cluster_samples - sorted_samples
+        loss = th.mean(th.sqrt(th.mean(diffs * diffs, dim=0)))
     return loss
 
 
