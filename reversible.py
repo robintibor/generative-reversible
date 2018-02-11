@@ -289,8 +289,19 @@ def log_gaussian_pdf_per_cluster(X, means_per_dim, stds_per_dim, eps=1e-6):
 import itertools
 
 
+def dist_transport_loss(means_per_dim, stds_per_dim):
+    assert len(means_per_dim) == 2
+    mean_diff = means_per_dim[1] - means_per_dim[0]
+    normed_diff = mean_diff / th.norm(mean_diff, p=2)
+
+    _, transformed_stds = transform_gaussian_by_dirs(means_per_dim, stds_per_dim, normed_diff.unsqueeze(0))
+    transformed_stds = transformed_stds.squeeze()
+    loss = -th.sqrt(th.sum(mean_diff * mean_diff)) + th.sqrt(th.sum(transformed_stds * transformed_stds))
+    return loss
+
+
 def pairwise_projection_loss(X, targets, means_per_dim, stds_per_dim,
-                             scaled=True):
+                             scaled=True, add_stds=False):
     outs_per_class_pair, midpoints, stds_per_pair = pairwise_projections(X, means_per_dim, stds_per_dim)
 
 
@@ -313,8 +324,10 @@ def pairwise_projection_loss(X, targets, means_per_dim, stds_per_dim,
         #
         relevant_stds = stds_per_pair[i_cluster]
         relevant_midpoints = midpoints[i_cluster]
-        scaled_stds = relevant_stds / midpoints
-        with_stds = relevant_outs + relevant_stds.unsqueeze(0)
+        if add_stds:
+            relevant_outs = relevant_outs + relevant_stds.unsqueeze(0)
+        #scaled_stds = relevant_stds / midpoints
+        #with_stds = relevant_outs + relevant_stds.unsqueeze(0)
         if scaled:
             scaled_outs = relevant_outs / (relevant_midpoints.unsqueeze(0) + 1e-6)
         else:
@@ -368,10 +381,11 @@ def pairwise_projections(X, means_per_dim, stds_per_dim):
         diff_vector = diff_between_clusters[i_c_a, i_c_b]
         relevant_means = th.stack((means_per_dim[i_c_a], means_per_dim[i_c_b]),
                                   dim=0)
+        normed_diff_vector = diff_vector / th.norm(diff_vector, p=2)
         relevant_stds = th.stack((stds_per_dim[i_c_a], stds_per_dim[i_c_b]),
                                  dim=0)
         _, pair_std = transform_gaussian_by_dirs(relevant_means, relevant_stds,
-                                                 diff_vector.unsqueeze(0))
+                                                 normed_diff_vector.unsqueeze(0))
         stds_per_pair[i_c_a, i_c_b] = th.sum(pair_std)
 
     return outs_per_class_pair, midpoints, stds_per_pair
@@ -381,7 +395,7 @@ def pairwise_projection_score(X, means_per_dim, stds_per_dim):
     outs_per_class_pair, midpoints, stds_per_pair = pairwise_projections(X, means_per_dim, stds_per_dim)
     with_stds = outs_per_class_pair + stds_per_pair.unsqueeze(0)
     scaled_outs = with_stds / (midpoints.unsqueeze(0) + 1e-6)
-    scores = -th.sum(scaled_outs * scaled_outs, dim=2)
+    scores = -th.sqrt(th.sum(scaled_outs * scaled_outs, dim=2))
     return scores
 
 
@@ -440,9 +454,9 @@ def sampled_transport_diffs_interpolate_sorted_part(
     else:
         assert abs_or_square == 'square'
         if backprop_to_cluster_weights:
-            sample_loss = th.sqrt(th.mean((diffs * diffs) * diff_weights))
+            sample_loss = th.mean((diffs * diffs) * diff_weights)
         else:
-            sample_loss = th.sqrt(th.mean(diffs * diffs))
+            sample_loss = th.mean(diffs * diffs)
     return sample_loss
 
 
@@ -665,6 +679,147 @@ def get_exact_size_batches(n_trials, rng, batch_size):
     last_batch = np.concatenate((last_batch, i_trials[:n_remain]))
     batches.append(last_batch)
     return batches
+
+
+def get_batches_equal_classes(targets, n_classes, rng, batch_size):
+    batches_per_cluster = []
+    for i_cluster in range(n_classes):
+        n_examples = np.sum(targets == i_cluster)
+        examples_per_batch = get_exact_size_batches(
+            n_examples, rng, batch_size)
+        this_cluster_indices = np.nonzero(targets == i_cluster)[0]
+        examples_per_batch = [this_cluster_indices[b] for b in examples_per_batch]
+        # revert back to actual indices
+        batches_per_cluster.append(examples_per_batch)
+
+    batches = np.concatenate(batches_per_cluster, axis=1)
+    return batches
+
+
+def train_epoch_per_class(
+        inputs, batch_size, rng,
+        feature_model,
+        means_per_dim, stds_per_dim, weights_per_cluster,
+        directions_adv,
+        optimizer, optimizer_adv,
+        std_l1, mean_l1, weight_l1,
+        clf, targets, loss_function):
+    feature_model.train()
+    all_trans_losses = []
+    all_l1_losses = []
+    all_target_losses = []
+    all_losses = []
+    examples_per_batch = get_batches_equal_classes(var_to_np(targets), 2, rng, batch_size)
+    for i_examples in examples_per_batch:
+        #print("weights_per_cluster epoch", weights_per_cluster)
+        batch_X = inputs[th.LongTensor(i_examples)]
+        batch_y = targets[th.LongTensor(i_examples)]
+        trans_loss, threshold_l1_penalty, target_loss, total_loss = train_on_batch_per_class(
+            batch_X, feature_model, means_per_dim,
+            stds_per_dim, weights_per_cluster,
+            directions_adv, optimizer, optimizer_adv,
+            std_l1=std_l1, mean_l1=mean_l1, weight_l1=weight_l1,
+            clf=clf, batch_y=batch_y, loss_function=loss_function,
+            add_mean_diff_directions=True)
+        all_trans_losses.append(var_to_np(trans_loss))
+        all_l1_losses.append(var_to_np(threshold_l1_penalty))
+        all_target_losses.append(var_to_np(target_loss))
+        all_losses.append(var_to_np(total_loss))
+    return all_trans_losses, all_l1_losses, all_target_losses, all_losses
+
+
+def train_on_batch_per_class(batch_X, feature_model,
+        means_per_dim, stds_per_dim, weights_per_cluster,
+        directions_adv, optimizer, optimizer_adv,
+        std_l1, mean_l1, weight_l1, clf, batch_y, loss_function,
+        add_mean_diff_directions=True):
+    assert batch_y is not None
+    assert len(batch_X) == len(batch_y)
+    batch_outs = feature_model(batch_X).squeeze()
+    trans_loss = compute_class_trans_loss(batch_outs,
+        means_per_dim, stds_per_dim,
+        directions_adv, batch_y,
+        add_mean_diff_directions=add_mean_diff_directions)
+
+    threshold_l1_penalty = ((th.mean(th.abs(stds_per_dim))) * std_l1 +
+                                th.mean(th.abs(weights_per_cluster)) * weight_l1 +
+                                th.mean(th.abs(means_per_dim)) * mean_l1)
+
+    assert batch_y is not None
+    if clf is not None:
+        preds = clf(batch_outs)
+    else:
+        preds = batch_outs
+    target_loss = loss_function(preds, batch_y)
+
+    total_loss = trans_loss + threshold_l1_penalty + target_loss
+    optimizer.zero_grad()
+    optimizer_adv.zero_grad()
+    total_loss.backward()
+    optimizer.step()
+    # directions should try to increase loss.
+    directions_adv.grad.data.neg_()
+    optimizer_adv.step()
+    weights_per_cluster.data.clamp_(min=0)
+    weights_per_cluster.data.div_(th.sum(weights_per_cluster.data))
+    stds_per_dim.data.clamp_(min=1e-4)
+
+    return trans_loss, threshold_l1_penalty, target_loss, total_loss
+
+
+def compute_class_trans_loss(batch_outs,
+        means_per_dim, stds_per_dim,
+        directions_adv, batch_y,
+        add_mean_diff_directions=True):
+    assert batch_y is not None
+    assert len(batch_outs) == len(batch_y)
+    trans_losses = []
+    if add_mean_diff_directions:
+        assert len(means_per_dim) == 2
+        mean_diff = means_per_dim[1] - means_per_dim[0]
+    for a_dir in [None, None, norm_and_var_directions(directions_adv)]:
+        if a_dir is None:
+            a_dir = sample_directions(
+                means_per_dim.size()[1], orthogonalize=True,
+                cuda=means_per_dim.is_cuda)
+        if add_mean_diff_directions:
+            a_dir = th.cat((a_dir, mean_diff.unsqueeze(0)), dim=0)
+        trans_loss = transport_loss_per_class(
+            batch_outs, means_per_dim, stds_per_dim, batch_y, directions=a_dir)
+        trans_losses.append(trans_loss)
+    trans_loss = th.sum(th.cat(trans_losses))
+    return trans_loss
+
+
+def transport_loss_per_class(
+        samples, means_per_dim, stds_per_dim,
+        targets,
+        cuda=False, directions=None):
+    if directions is None:
+        directions = sample_directions(samples.size()[1], True, cuda=cuda)
+    else:
+        directions = norm_and_var_directions(directions)
+    loss = 0
+    for i_cluster in range(len(means_per_dim)):
+        this_samples = samples[(targets == i_cluster).unsqueeze(1)].view(-1,means_per_dim.size()[1])
+        projected_samples = th.mm(this_samples, directions.t())
+        transformed_means, transformed_stds = transform_gaussian_by_dirs(
+            means_per_dim[i_cluster:i_cluster+1], stds_per_dim[i_cluster:i_cluster+1],
+                                  directions)
+        #now directions x what?
+        sorted_samples, _ = th.sort(projected_samples, dim=0)
+        n_samples = len(projected_samples)
+        empirical_cdf = th.linspace(1 / (n_samples), 1 - (1 / (n_samples)),
+                                        n_samples).unsqueeze(0)
+        # see https://en.wikipedia.org/wiki/Normal_distribution -> Quantile function
+        i_cdf = th.FloatTensor([np.sqrt(2.0)]) * th.erfinv(2 * empirical_cdf - 1)
+        i_cdf = i_cdf.squeeze()
+        i_cdf = th.autograd.Variable(i_cdf)
+        all_i_cdfs = i_cdf.unsqueeze(1) * transformed_stds.t() + transformed_means.t()
+        diffs = all_i_cdfs - sorted_samples
+        loss = th.sqrt(th.mean(diffs * diffs)) + loss
+    loss = loss / len(means_per_dim)
+    return loss
 
 
 def train_epoch(
