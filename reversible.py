@@ -300,6 +300,17 @@ def dist_transport_loss(means_per_dim, stds_per_dim):
     return loss
 
 
+def dist_transport_loss_relative(means_per_dim, stds_per_dim):
+    assert len(means_per_dim) == 2
+    mean_diff = means_per_dim[1] - means_per_dim[0]
+    normed_diff = mean_diff / th.norm(mean_diff, p=2)
+
+    _, transformed_stds = transform_gaussian_by_dirs(means_per_dim, stds_per_dim, normed_diff.unsqueeze(0))
+    transformed_stds = transformed_stds.squeeze()
+    loss = (th.sum(transformed_stds) + 1) / (th.sqrt(th.sum(mean_diff * mean_diff)))
+    return loss
+
+
 def pairwise_projection_loss(X, targets, means_per_dim, stds_per_dim,
                              scaled=True, add_stds=False):
     outs_per_class_pair, midpoints, stds_per_pair = pairwise_projections(X, means_per_dim, stds_per_dim)
@@ -456,7 +467,7 @@ def sampled_transport_diffs_interpolate_sorted_part(
         if backprop_to_cluster_weights:
             sample_loss = th.mean((diffs * diffs) * diff_weights)
         else:
-            sample_loss = th.mean(diffs * diffs)
+            sample_loss = th.sqrt(th.mean(diffs * diffs))
     return sample_loss
 
 
@@ -735,6 +746,9 @@ def train_on_batch_per_class(batch_X, feature_model,
         add_mean_diff_directions=True):
     assert batch_y is not None
     assert len(batch_X) == len(batch_y)
+    if list(feature_model.parameters())[0].is_cuda:
+        batch_X = batch_X.cuda()
+        batch_y = batch_y.cuda()
     batch_outs = feature_model(batch_X).squeeze()
     trans_loss = compute_class_trans_loss(batch_outs,
         means_per_dim, stds_per_dim,
@@ -815,9 +829,12 @@ def transport_loss_per_class(
         i_cdf = th.FloatTensor([np.sqrt(2.0)]) * th.erfinv(2 * empirical_cdf - 1)
         i_cdf = i_cdf.squeeze()
         i_cdf = th.autograd.Variable(i_cdf)
+        i_cdf, transformed_means = ensure_on_same_device(i_cdf, transformed_means)
         all_i_cdfs = i_cdf.unsqueeze(1) * transformed_stds.t() + transformed_means.t()
         diffs = all_i_cdfs - sorted_samples
-        loss = th.sqrt(th.mean(diffs * diffs)) + loss
+        # diffs are examples x directions
+        #loss = th.sqrt(th.mean(diffs * diffs)) + loss
+        loss = th.mean(th.sqrt(th.mean(diffs * diffs, dim=0))) + loss
     loss = loss / len(means_per_dim)
     return loss
 
