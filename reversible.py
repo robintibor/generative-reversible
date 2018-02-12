@@ -923,7 +923,8 @@ def transport_loss_per_class(
 
 
 class OptimizerUnlabelled(object):
-    def __init__(self, unlabeled_cluster_weights, lr=10, alpha=0.1):
+    def __init__(self, unlabeled_cluster_weights, lr=10, alpha=0.1,
+                 always_accumulate=False):
         self.unlabeled_cluster_weights = unlabeled_cluster_weights
         self.grad_hist_unlabeled = th.zeros(len(unlabeled_cluster_weights),
                                             2)
@@ -931,18 +932,24 @@ class OptimizerUnlabelled(object):
             self.grad_hist_unlabeled = self.grad_hist_unlabeled.cuda()
         self.lr = lr
         self.alpha = alpha
+        self.always_accumulate = always_accumulate
 
     def zero_grad(self):
         if self.unlabeled_cluster_weights.grad is not None:
             self.unlabeled_cluster_weights.grad.data.zero_()
 
     def step(self):
+        if self.always_accumulate:
+            gradient_unlabeled = th.zeros(len(self.grad_hist_unlabeled))
         neg_grad_labels = self.grad_hist_unlabeled[:, 0]
         mask = self.unlabeled_cluster_weights.grad.data > 0
         relevant_neg = neg_grad_labels[mask]
         relevant_neg = (1 - self.alpha) * relevant_neg + (
             self.alpha * th.abs(self.unlabeled_cluster_weights.grad.data[mask]))
         neg_grad_labels[mask] = relevant_neg
+        if self.always_accumulate:
+            other_grads = self.grad_hist_unlabeled[:, 1]
+            gradient_unlabeled[mask] = th.abs(self.unlabeled_cluster_weights.grad.data[mask]) - other_grads[mask]
 
         pos_grad_labels = self.grad_hist_unlabeled[:, 1]
         mask = self.unlabeled_cluster_weights.grad.data < 0
@@ -950,8 +957,12 @@ class OptimizerUnlabelled(object):
         relevant_pos = (1 - self.alpha) * relevant_pos + (
             self.alpha * th.abs(self.unlabeled_cluster_weights.grad.data[mask]))
         pos_grad_labels[mask] = relevant_pos
+        if self.always_accumulate:
+            other_grads = self.grad_hist_unlabeled[:, 0]
+            gradient_unlabeled[mask] = -th.abs(self.unlabeled_cluster_weights.grad.data[mask]) + other_grads[mask]
 
-        gradient_unlabeled = self.grad_hist_unlabeled[:,
+        if not self.always_accumulate:
+            gradient_unlabeled = self.grad_hist_unlabeled[:,
                              0] - self.grad_hist_unlabeled[:, 1]
         self.unlabeled_cluster_weights.data = self.unlabeled_cluster_weights.data - self.lr * gradient_unlabeled
         self.unlabeled_cluster_weights.data = self.unlabeled_cluster_weights.data / (
