@@ -716,12 +716,12 @@ def train_epoch_per_class(
         optimizer, optimizer_adv,
         std_l1, mean_l1, weight_l1,
         clf, targets, loss_function,
-        unlabelled_inputs):
+        unlabelled_inputs,
+        unlabeled_cluster_weights):
     feature_model.train()
     all_trans_losses = []
     all_l1_losses = []
     all_target_losses = []
-    all_unlabeled_losses = []
     all_losses = []
     examples_per_batch = get_batches_equal_classes(var_to_np(targets), 2, rng, batch_size)
     for i_examples in examples_per_batch:
@@ -729,20 +729,20 @@ def train_epoch_per_class(
         batch_X = inputs[th.LongTensor(i_examples)]
         batch_y = targets[th.LongTensor(i_examples)]
         (trans_loss, threshold_l1_penalty, target_loss,
-         unlabelled_loss, total_loss) = train_on_batch_per_class(
+         total_loss) = train_on_batch_per_class(
                 batch_X, feature_model, means_per_dim,
                 stds_per_dim, weights_per_cluster,
                 directions_adv, optimizer, optimizer_adv,
                 std_l1=std_l1, mean_l1=mean_l1, weight_l1=weight_l1,
                 clf=clf, batch_y=batch_y, loss_function=loss_function,
                 add_mean_diff_directions=True,
-                unlabelled_inputs=unlabelled_inputs)
+                unlabelled_inputs=unlabelled_inputs,
+                unlabeled_cluster_weights=unlabeled_cluster_weights)
         all_trans_losses.append(var_to_np(trans_loss))
         all_l1_losses.append(var_to_np(threshold_l1_penalty))
         all_target_losses.append(var_to_np(target_loss))
-        all_unlabeled_losses.append(var_to_np(unlabelled_loss))
         all_losses.append(var_to_np(total_loss))
-    return all_trans_losses, all_l1_losses, all_target_losses, all_unlabeled_losses, all_losses
+    return all_trans_losses, all_l1_losses, all_target_losses, all_losses
 
 
 def train_on_batch_per_class(
@@ -751,7 +751,7 @@ def train_on_batch_per_class(
         directions_adv, optimizer, optimizer_adv,
         std_l1, mean_l1, weight_l1, clf, batch_y, loss_function,
         add_mean_diff_directions=True,
-        unlabelled_inputs=None):
+        unlabelled_inputs=None, unlabeled_cluster_weights=None):
     assert batch_y is not None
     assert len(batch_X) == len(batch_y)
     if list(feature_model.parameters())[0].is_cuda:
@@ -760,21 +760,17 @@ def train_on_batch_per_class(
         if unlabelled_inputs is not None:
             unlabelled_inputs = unlabelled_inputs.cuda()
     batch_outs = feature_model(batch_X).squeeze()
+    if unlabelled_inputs is not None:
+        unlabeled_outs = feature_model(unlabelled_inputs).squeeze()
+    else:
+        unlabeled_outs = None
     trans_loss = compute_class_trans_loss(
         batch_outs,
         means_per_dim, stds_per_dim,
         directions_adv, batch_y,
-        add_mean_diff_directions=add_mean_diff_directions)
-    if unlabelled_inputs is not None:
-        unlabelled_outs = feature_model(unlabelled_inputs).squeeze()
-        unlabelled_loss = compute_class_trans_loss(
-            unlabelled_outs, means_per_dim, stds_per_dim,
-            directions_adv, batch_y=None,
-            add_mean_diff_directions = add_mean_diff_directions)
-    else:
-        unlabelled_loss = np_to_var([0], dtype=np.float32)
-        trans_loss, unlabelled_loss = ensure_on_same_device(
-            trans_loss, unlabelled_loss)
+        add_mean_diff_directions=add_mean_diff_directions,
+        unlabeled_outs=unlabeled_outs,
+        unlabeled_cluster_weights=unlabeled_cluster_weights)
 
     threshold_l1_penalty = ((th.mean(th.abs(stds_per_dim))) * std_l1 +
                                 th.mean(th.abs(weights_per_cluster)) * weight_l1 +
@@ -787,7 +783,7 @@ def train_on_batch_per_class(
         preds = batch_outs
     target_loss = loss_function(preds, batch_y)
 
-    total_loss = trans_loss + threshold_l1_penalty + target_loss + unlabelled_loss
+    total_loss = trans_loss + threshold_l1_penalty + target_loss
     optimizer.zero_grad()
     optimizer_adv.zero_grad()
     total_loss.backward()
@@ -799,13 +795,16 @@ def train_on_batch_per_class(
     weights_per_cluster.data.div_(th.sum(weights_per_cluster.data))
     stds_per_dim.data.clamp_(min=1e-4)
 
-    return trans_loss, threshold_l1_penalty, target_loss, unlabelled_loss, total_loss
+    return trans_loss, threshold_l1_penalty, target_loss, total_loss
 
 
-def compute_class_trans_loss(batch_outs,
+def compute_class_trans_loss(
+        batch_outs,
         means_per_dim, stds_per_dim,
         directions_adv, batch_y,
-        add_mean_diff_directions=True):
+        add_mean_diff_directions=True,
+        unlabeled_outs=None,
+        unlabeled_cluster_weights=None):
     if batch_y is not None:
         assert len(batch_outs) == len(batch_y)
     trans_losses = []
@@ -824,7 +823,9 @@ def compute_class_trans_loss(batch_outs,
         if add_mean_diff_directions:
             a_dir = th.cat((a_dir, mean_diff.unsqueeze(0)), dim=0)
         trans_loss = transport_loss_per_class(
-            batch_outs, means_per_dim, stds_per_dim, batch_y, directions=a_dir)
+            batch_outs, means_per_dim, stds_per_dim, batch_y, directions=a_dir,
+            unlabeled_samples=unlabeled_outs,
+            unlabeled_cluster_weights=unlabeled_cluster_weights)
         trans_losses.append(trans_loss)
     trans_loss = th.sum(th.cat(trans_losses))
     return trans_loss
@@ -832,47 +833,60 @@ def compute_class_trans_loss(batch_outs,
 
 def transport_loss_per_class(
         samples, means_per_dim, stds_per_dim,
-        targets, directions=None, cuda=False):
+        targets, directions=None, cuda=False, unlabeled_samples=None,
+        unlabeled_cluster_weights=None):
     if directions is None:
         directions = sample_directions(samples.size()[1], True, cuda=cuda)
     else:
         directions = norm_and_var_directions(directions)
     n_clusters = len(means_per_dim)
-    projected_samples = th.mm(samples, directions.t())
+    assert n_clusters == 2
+
+    if unlabeled_samples is not None:
+        all_samples  = th.cat((samples, unlabeled_samples), dim=0)
+    else:
+        all_samples = samples
+
+    projected_samples = th.mm(all_samples, directions.t())
     transformed_means, transformed_stds = transform_gaussian_by_dirs(
         means_per_dim, stds_per_dim, directions)
-    if targets is not None:
-        loss = 0
-        for i_cluster in range(n_clusters):
-            this_samples = projected_samples[
-                (targets == i_cluster).unsqueeze(1)].view(-1, len(directions))
-            # now directions x what?
-            sorted_samples, _ = th.sort(this_samples, dim=0)
-            this_transformed_means = transformed_means[:,
-                                     i_cluster:i_cluster + 1]
-            this_transformed_stds = transformed_stds[:, i_cluster:i_cluster + 1]
-            n_samples = len(this_samples)
-            empirical_cdf = th.linspace(1 / (n_samples), 1 - (1 / (n_samples)),
-                                        n_samples).unsqueeze(0)
-            # see https://en.wikipedia.org/wiki/Normal_distribution -> Quantile function
-            i_cdf = th.FloatTensor([np.sqrt(2.0)]) * th.erfinv(
-                2 * empirical_cdf - 1)
-            i_cdf = i_cdf.squeeze()
-            i_cdf = th.autograd.Variable(i_cdf)
-            i_cdf, this_transformed_means = ensure_on_same_device(i_cdf,
-                                                                  this_transformed_means)
+    weights_per_labeled_sample = th.ones(len(samples))
+    weights_per_labeled_sample, samples = ensure_on_same_device(
+        weights_per_labeled_sample, samples)
+    weights_per_labeled_sample = th.autograd.Variable(weights_per_labeled_sample)
+    # directions x clusters
+    if unlabeled_samples is not None:
+        normed_unlabeled_cluster_weights = unlabeled_cluster_weights
+        normed_unlabeled_cluster_weights = normed_unlabeled_cluster_weights / (
+            (th.mean(normed_unlabeled_cluster_weights, dim=0, keepdim=True)) * 2)
 
-            all_i_cdfs = i_cdf.unsqueeze(
-                1) * this_transformed_stds.t() + this_transformed_means.t()
-            diffs = all_i_cdfs - sorted_samples
-            # diffs are examples x directions
-            loss = th.sqrt(th.mean(diffs * diffs)) + loss
-            #loss = th.mean(th.sqrt(th.mean(diffs * diffs, dim=0))) + loss
-        loss = loss / n_clusters
+        targets_unlabelled = th.bernoulli(normed_unlabeled_cluster_weights)
+        all_targets = th.cat((targets, targets_unlabelled.type(th.LongTensor)), dim=0)
+
+        weights_per_unlabelled_sample = (targets_unlabelled * (normed_unlabeled_cluster_weights + 1e-6) +
+                                     (1- targets_unlabelled) * (1 - normed_unlabeled_cluster_weights + 1e-6))
+        weights_per_unlabelled_sample = weights_per_unlabelled_sample / th.autograd.Variable(weights_per_unlabelled_sample.data)
+        weights_per_sample = th.cat((weights_per_unlabelled_sample, weights_per_labeled_sample), dim=0)
     else:
-        assert len(samples) % n_clusters == 0
-        samples_per_cluster = []
-        n_samples = len(samples) // n_clusters
+        all_targets = targets
+        weights_per_sample = weights_per_labeled_sample
+
+    loss = 0
+    for i_cluster in range(n_clusters):
+        this_samples = projected_samples[
+            (all_targets == i_cluster).unsqueeze(1)].view(-1, len(directions))
+        this_diff_weights = weights_per_sample[(all_targets == i_cluster)]
+        # now examples x directions
+        sorted_samples, i_sorted = th.sort(this_samples, dim=0)
+        all_diff_weights = th.stack(
+                [this_diff_weights[i_sorted[:, i_dim]]
+                 for i_dim in range(i_sorted.size()[1])],
+                dim=1)
+        # still examples x directions
+        this_transformed_means = transformed_means[:,
+                                 i_cluster:i_cluster + 1]
+        this_transformed_stds = transformed_stds[:, i_cluster:i_cluster + 1]
+        n_samples = len(this_samples)
         empirical_cdf = th.linspace(1 / (n_samples), 1 - (1 / (n_samples)),
                                     n_samples).unsqueeze(0)
         # see https://en.wikipedia.org/wiki/Normal_distribution -> Quantile function
@@ -880,22 +894,19 @@ def transport_loss_per_class(
             2 * empirical_cdf - 1)
         i_cdf = i_cdf.squeeze()
         i_cdf = th.autograd.Variable(i_cdf)
-        i_cdf, transformed_means = ensure_on_same_device(i_cdf,
-                                                         transformed_means)
-        for i_cluster in range(n_clusters):
-            this_transformed_means = transformed_means[:,
-                                     i_cluster:i_cluster + 1]
-            this_transformed_stds = transformed_stds[:, i_cluster:i_cluster + 1]
-            all_i_cdfs_this_cluster = i_cdf.unsqueeze(
-                1) * this_transformed_stds.t() + this_transformed_means.t()
-            samples_per_cluster.append(all_i_cdfs_this_cluster)
-        all_i_cdfs = th.cat(samples_per_cluster, dim=0)
-        sorted_cluster_samples, _ = th.sort(all_i_cdfs, dim=0)
-        sorted_samples, _ = th.sort(projected_samples, dim=0)
-        diffs = sorted_cluster_samples - sorted_samples
-        #loss = th.mean(th.sqrt(th.mean(diffs * diffs, dim=0)))
-        loss = th.sqrt(th.mean(diffs * diffs))
+        i_cdf, this_transformed_means = ensure_on_same_device(i_cdf,
+                                                              this_transformed_means)
+
+        all_i_cdfs = i_cdf.unsqueeze(
+            1) * this_transformed_stds.t() + this_transformed_means.t()
+        diffs = all_i_cdfs - sorted_samples
+        # diffs are examples x directions
+        loss = th.sqrt(th.mean(diffs * diffs * all_diff_weights)) + loss
+        #loss = th.mean(th.sqrt(th.mean(diffs * diffs, dim=0))) + loss
+    loss = loss / n_clusters
     return loss
+
+
 
 
 def train_epoch(
