@@ -300,14 +300,14 @@ def dist_transport_loss(means_per_dim, stds_per_dim):
     return loss
 
 
-def dist_transport_loss_relative(means_per_dim, stds_per_dim):
+def dist_transport_loss_relative(means_per_dim, stds_per_dim, std_offset=1):
     assert len(means_per_dim) == 2
     mean_diff = means_per_dim[1] - means_per_dim[0]
     normed_diff = mean_diff / th.norm(mean_diff, p=2)
 
     _, transformed_stds = transform_gaussian_by_dirs(means_per_dim, stds_per_dim, normed_diff.unsqueeze(0))
     transformed_stds = transformed_stds.squeeze()
-    loss = (th.sum(transformed_stds) + 1) / (th.sqrt(th.sum(mean_diff * mean_diff)))
+    loss = (th.sum(transformed_stds) + std_offset) / (th.sqrt(th.sum(mean_diff * mean_diff)))
     return loss
 
 
@@ -717,7 +717,8 @@ def train_epoch_per_class(
         std_l1, mean_l1, weight_l1,
         clf, targets, loss_function,
         unlabelled_inputs,
-        unlabeled_cluster_weights):
+        unlabeled_cluster_weights,
+        optim_unlabeled):
     feature_model.train()
     all_trans_losses = []
     all_l1_losses = []
@@ -737,7 +738,8 @@ def train_epoch_per_class(
                 clf=clf, batch_y=batch_y, loss_function=loss_function,
                 add_mean_diff_directions=True,
                 unlabelled_inputs=unlabelled_inputs,
-                unlabeled_cluster_weights=unlabeled_cluster_weights)
+                unlabeled_cluster_weights=unlabeled_cluster_weights,
+                optim_unlabeled=optim_unlabeled)
         all_trans_losses.append(var_to_np(trans_loss))
         all_l1_losses.append(var_to_np(threshold_l1_penalty))
         all_target_losses.append(var_to_np(target_loss))
@@ -751,7 +753,8 @@ def train_on_batch_per_class(
         directions_adv, optimizer, optimizer_adv,
         std_l1, mean_l1, weight_l1, clf, batch_y, loss_function,
         add_mean_diff_directions=True,
-        unlabelled_inputs=None, unlabeled_cluster_weights=None):
+        unlabelled_inputs=None, unlabeled_cluster_weights=None,
+        optim_unlabeled=None):
     assert batch_y is not None
     assert len(batch_X) == len(batch_y)
     if list(feature_model.parameters())[0].is_cuda:
@@ -784,10 +787,14 @@ def train_on_batch_per_class(
     target_loss = loss_function(preds, batch_y)
 
     total_loss = trans_loss + threshold_l1_penalty + target_loss
+    if optim_unlabeled is not None:
+        optim_unlabeled.zero_grad()
     optimizer.zero_grad()
     optimizer_adv.zero_grad()
     total_loss.backward()
     optimizer.step()
+    if optim_unlabeled is not None:
+        optim_unlabeled.step()
     # directions should try to increase loss.
     directions_adv.grad.data.neg_()
     optimizer_adv.step()
@@ -858,15 +865,23 @@ def transport_loss_per_class(
     if unlabeled_samples is not None:
         normed_unlabeled_cluster_weights = unlabeled_cluster_weights
         normed_unlabeled_cluster_weights = normed_unlabeled_cluster_weights / (
-            (th.mean(normed_unlabeled_cluster_weights, dim=0, keepdim=True)) * 2)
-
+            (th.mean(normed_unlabeled_cluster_weights) * 2))
+        normed_unlabeled_cluster_weights = th.clamp(normed_unlabeled_cluster_weights,
+                                                    min=0.01, max=0.99)
         targets_unlabelled = th.bernoulli(normed_unlabeled_cluster_weights)
-        all_targets = th.cat((targets, targets_unlabelled.type(th.LongTensor)), dim=0)
+        targets, targets_unlabelled = ensure_on_same_device(
+            targets, targets_unlabelled)
+        # for multiplication keep targets_unlabelled as float
 
         weights_per_unlabelled_sample = (targets_unlabelled * (normed_unlabeled_cluster_weights + 1e-6) +
                                      (1- targets_unlabelled) * (1 - normed_unlabeled_cluster_weights + 1e-6))
         weights_per_unlabelled_sample = weights_per_unlabelled_sample / th.autograd.Variable(weights_per_unlabelled_sample.data)
-        weights_per_sample = th.cat((weights_per_unlabelled_sample, weights_per_labeled_sample), dim=0)
+        weights_per_sample = th.cat((weights_per_labeled_sample, weights_per_unlabelled_sample), dim=0)
+        # for later selection, make targets into long
+        targets_unlabelled = targets_unlabelled.type(th.LongTensor)
+        targets, targets_unlabelled = ensure_on_same_device(
+            targets, targets_unlabelled)
+        all_targets = th.cat((targets, targets_unlabelled), dim=0)
     else:
         all_targets = targets
         weights_per_sample = weights_per_labeled_sample
@@ -907,6 +922,43 @@ def transport_loss_per_class(
     return loss
 
 
+class OptimizerUnlabelled(object):
+    def __init__(self, unlabeled_cluster_weights, lr=10, alpha=0.1):
+        self.unlabeled_cluster_weights = unlabeled_cluster_weights
+        self.grad_hist_unlabeled = th.zeros(len(unlabeled_cluster_weights),
+                                            2)
+        if self.unlabeled_cluster_weights.is_cuda:
+            self.grad_hist_unlabeled = self.grad_hist_unlabeled.cuda()
+        self.lr = lr
+        self.alpha = alpha
+
+    def zero_grad(self):
+        if self.unlabeled_cluster_weights.grad is not None:
+            self.unlabeled_cluster_weights.grad.data.zero_()
+
+    def step(self):
+        neg_grad_labels = self.grad_hist_unlabeled[:, 0]
+        mask = self.unlabeled_cluster_weights.grad.data > 0
+        relevant_neg = neg_grad_labels[mask]
+        relevant_neg = (1 - self.alpha) * relevant_neg + (
+            self.alpha * th.abs(self.unlabeled_cluster_weights.grad.data[mask]))
+        neg_grad_labels[mask] = relevant_neg
+
+        pos_grad_labels = self.grad_hist_unlabeled[:, 1]
+        mask = self.unlabeled_cluster_weights.grad.data < 0
+        relevant_pos = pos_grad_labels[mask]
+        relevant_pos = (1 - self.alpha) * relevant_pos + (
+            self.alpha * th.abs(self.unlabeled_cluster_weights.grad.data[mask]))
+        pos_grad_labels[mask] = relevant_pos
+
+        gradient_unlabeled = self.grad_hist_unlabeled[:,
+                             0] - self.grad_hist_unlabeled[:, 1]
+        self.unlabeled_cluster_weights.data = self.unlabeled_cluster_weights.data - self.lr * gradient_unlabeled
+        self.unlabeled_cluster_weights.data = self.unlabeled_cluster_weights.data / (
+            (th.mean(self.unlabeled_cluster_weights.data, dim=0,
+                     keepdim=True)) * 2)
+        self.unlabeled_cluster_weights.data = th.clamp(
+            self.unlabeled_cluster_weights.data, min=0.01, max=0.99)
 
 
 def train_epoch(
