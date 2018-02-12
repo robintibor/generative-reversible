@@ -4,7 +4,7 @@ import numpy as np
 from scipy import interpolate
 import matplotlib.pyplot as plt
 from matplotlib import cm
-from braindecode.torch_ext.util import var_to_np
+from braindecode.torch_ext.util import var_to_np, np_to_var
 from braindecode.datautil.iterators import get_balanced_batches
 
 
@@ -715,46 +715,66 @@ def train_epoch_per_class(
         directions_adv,
         optimizer, optimizer_adv,
         std_l1, mean_l1, weight_l1,
-        clf, targets, loss_function):
+        clf, targets, loss_function,
+        unlabelled_inputs):
     feature_model.train()
     all_trans_losses = []
     all_l1_losses = []
     all_target_losses = []
+    all_unlabeled_losses = []
     all_losses = []
     examples_per_batch = get_batches_equal_classes(var_to_np(targets), 2, rng, batch_size)
     for i_examples in examples_per_batch:
         #print("weights_per_cluster epoch", weights_per_cluster)
         batch_X = inputs[th.LongTensor(i_examples)]
         batch_y = targets[th.LongTensor(i_examples)]
-        trans_loss, threshold_l1_penalty, target_loss, total_loss = train_on_batch_per_class(
-            batch_X, feature_model, means_per_dim,
-            stds_per_dim, weights_per_cluster,
-            directions_adv, optimizer, optimizer_adv,
-            std_l1=std_l1, mean_l1=mean_l1, weight_l1=weight_l1,
-            clf=clf, batch_y=batch_y, loss_function=loss_function,
-            add_mean_diff_directions=True)
+        (trans_loss, threshold_l1_penalty, target_loss,
+         unlabelled_loss, total_loss) = train_on_batch_per_class(
+                batch_X, feature_model, means_per_dim,
+                stds_per_dim, weights_per_cluster,
+                directions_adv, optimizer, optimizer_adv,
+                std_l1=std_l1, mean_l1=mean_l1, weight_l1=weight_l1,
+                clf=clf, batch_y=batch_y, loss_function=loss_function,
+                add_mean_diff_directions=True,
+                unlabelled_inputs=unlabelled_inputs)
         all_trans_losses.append(var_to_np(trans_loss))
         all_l1_losses.append(var_to_np(threshold_l1_penalty))
         all_target_losses.append(var_to_np(target_loss))
+        all_unlabeled_losses.append(var_to_np(unlabelled_loss))
         all_losses.append(var_to_np(total_loss))
-    return all_trans_losses, all_l1_losses, all_target_losses, all_losses
+    return all_trans_losses, all_l1_losses, all_target_losses, all_unlabeled_losses, all_losses
 
 
-def train_on_batch_per_class(batch_X, feature_model,
+def train_on_batch_per_class(
+        batch_X, feature_model,
         means_per_dim, stds_per_dim, weights_per_cluster,
         directions_adv, optimizer, optimizer_adv,
         std_l1, mean_l1, weight_l1, clf, batch_y, loss_function,
-        add_mean_diff_directions=True):
+        add_mean_diff_directions=True,
+        unlabelled_inputs=None):
     assert batch_y is not None
     assert len(batch_X) == len(batch_y)
     if list(feature_model.parameters())[0].is_cuda:
         batch_X = batch_X.cuda()
         batch_y = batch_y.cuda()
+        if unlabelled_inputs is not None:
+            unlabelled_inputs = unlabelled_inputs.cuda()
     batch_outs = feature_model(batch_X).squeeze()
-    trans_loss = compute_class_trans_loss(batch_outs,
+    trans_loss = compute_class_trans_loss(
+        batch_outs,
         means_per_dim, stds_per_dim,
         directions_adv, batch_y,
         add_mean_diff_directions=add_mean_diff_directions)
+    if unlabelled_inputs is not None:
+        unlabelled_outs = feature_model(unlabelled_inputs).squeeze()
+        unlabelled_loss = compute_class_trans_loss(
+            unlabelled_outs, means_per_dim, stds_per_dim,
+            directions_adv, batch_y=None,
+            add_mean_diff_directions = add_mean_diff_directions)
+    else:
+        unlabelled_loss = np_to_var([0], dtype=np.float32)
+        trans_loss, unlabelled_loss = ensure_on_same_device(
+            trans_loss, unlabelled_loss)
 
     threshold_l1_penalty = ((th.mean(th.abs(stds_per_dim))) * std_l1 +
                                 th.mean(th.abs(weights_per_cluster)) * weight_l1 +
@@ -767,7 +787,7 @@ def train_on_batch_per_class(batch_X, feature_model,
         preds = batch_outs
     target_loss = loss_function(preds, batch_y)
 
-    total_loss = trans_loss + threshold_l1_penalty + target_loss
+    total_loss = trans_loss + threshold_l1_penalty + target_loss + unlabelled_loss
     optimizer.zero_grad()
     optimizer_adv.zero_grad()
     total_loss.backward()
@@ -779,20 +799,24 @@ def train_on_batch_per_class(batch_X, feature_model,
     weights_per_cluster.data.div_(th.sum(weights_per_cluster.data))
     stds_per_dim.data.clamp_(min=1e-4)
 
-    return trans_loss, threshold_l1_penalty, target_loss, total_loss
+    return trans_loss, threshold_l1_penalty, target_loss, unlabelled_loss, total_loss
 
 
 def compute_class_trans_loss(batch_outs,
         means_per_dim, stds_per_dim,
         directions_adv, batch_y,
         add_mean_diff_directions=True):
-    assert batch_y is not None
-    assert len(batch_outs) == len(batch_y)
+    if batch_y is not None:
+        assert len(batch_outs) == len(batch_y)
     trans_losses = []
     if add_mean_diff_directions:
         assert len(means_per_dim) == 2
         mean_diff = means_per_dim[1] - means_per_dim[0]
-    for a_dir in [None, None, norm_and_var_directions(directions_adv)]:
+    dirs = [None, None, norm_and_var_directions(directions_adv)]
+    # HACKHACK!!
+    if batch_y is None:
+        dirs = [mean_diff.unsqueeze(0)]
+    for a_dir in dirs:
         if a_dir is None:
             a_dir = sample_directions(
                 means_per_dim.size()[1], orthogonalize=True,
@@ -808,7 +832,7 @@ def compute_class_trans_loss(batch_outs,
 
 def transport_loss_per_class(
         samples, means_per_dim, stds_per_dim,
-        targets, directions=None):
+        targets, directions=None, cuda=False):
     if directions is None:
         directions = sample_directions(samples.size()[1], True, cuda=cuda)
     else:
@@ -842,8 +866,8 @@ def transport_loss_per_class(
                 1) * this_transformed_stds.t() + this_transformed_means.t()
             diffs = all_i_cdfs - sorted_samples
             # diffs are examples x directions
-            # loss = th.sqrt(th.mean(diffs * diffs)) + loss
-            loss = th.mean(th.sqrt(th.mean(diffs * diffs, dim=0))) + loss
+            loss = th.sqrt(th.mean(diffs * diffs)) + loss
+            #loss = th.mean(th.sqrt(th.mean(diffs * diffs, dim=0))) + loss
         loss = loss / n_clusters
     else:
         assert len(samples) % n_clusters == 0
@@ -869,7 +893,8 @@ def transport_loss_per_class(
         sorted_cluster_samples, _ = th.sort(all_i_cdfs, dim=0)
         sorted_samples, _ = th.sort(projected_samples, dim=0)
         diffs = sorted_cluster_samples - sorted_samples
-        loss = th.mean(th.sqrt(th.mean(diffs * diffs, dim=0)))
+        #loss = th.mean(th.sqrt(th.mean(diffs * diffs, dim=0)))
+        loss = th.sqrt(th.mean(diffs * diffs))
     return loss
 
 
