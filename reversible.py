@@ -922,6 +922,52 @@ def transport_loss_per_class(
     return loss
 
 
+def icdf_grad(p, sigma):
+    sqrt_2 = float(np.sqrt(2))
+    return sigma * sqrt_2 * 2 * erfinv_grad(2*p - 1)
+
+
+def erfinv_grad(p):
+    sqrt_pi = float(np.sqrt(np.pi))
+    erfinved_p = th.erfinv(p)
+    return 0.5 * sqrt_pi * th.exp(erfinved_p * erfinved_p)
+
+
+def compute_icdf_grad_accuracy(outs, targets, means_per_dim, stds_per_dim):
+    assert len(outs) == len(targets), "Should have same number of outputs as targets"
+    distances = compute_icdf_grads_to_mean(outs, means_per_dim, stds_per_dim)
+    diffs_to_means = outs.unsqueeze(1) - means_per_dim.unsqueeze(0)
+    cluster_stds = th.cat([transform_gaussian_by_dirs(means_per_dim[i_cluster:i_cluster+1],
+                                                         stds_per_dim[i_cluster:i_cluster+1],
+                                                         diffs_to_means[:, i_cluster])[1]
+                          for i_cluster in range(means_per_dim.size()[0])], dim=1)
+
+    # cluster stds examples x clusters
+    x_euclid_diff = th.sqrt(th.sum(diffs_to_means * diffs_to_means, dim=2))
+    # examples x clusters
+    cdfs = 0.5 * (1 + th.erf(x_euclid_diff / (cluster_stds * np.sqrt(2))))
+    # cdfs examples x clusters
+    distances = icdf_grad(cdfs - 1e-7, cluster_stds)
+    assert len(distances) == len(targets)
+    return np.mean(np.argmin(var_to_np(distances), axis=1) == var_to_np(targets))
+
+def compute_icdf_grads_to_mean(outs, means_per_dim, stds_per_dim):
+    diffs_to_means = outs.unsqueeze(1) - means_per_dim.unsqueeze(0)
+    cluster_stds = th.cat(
+        [transform_gaussian_by_dirs(means_per_dim[i_cluster:i_cluster + 1],
+                                    stds_per_dim[i_cluster:i_cluster + 1],
+                                    diffs_to_means[:, i_cluster])[1]
+         for i_cluster in range(means_per_dim.size()[0])], dim=1)
+
+    # cluster stds examples x clusters
+    x_euclid_diff = th.sqrt(th.sum(diffs_to_means * diffs_to_means, dim=2))
+    # examples x clusters
+    cdfs = 0.5 * (1 + th.erf(x_euclid_diff / (cluster_stds * np.sqrt(2))))
+    # cdfs examples x clusters
+    distances = icdf_grad(cdfs - 1e-7, cluster_stds)
+    return distances
+
+
 class OptimizerUnlabelled(object):
     def __init__(self, unlabeled_cluster_weights, lr=10, alpha=0.1,
                  always_accumulate=False):
@@ -941,6 +987,8 @@ class OptimizerUnlabelled(object):
     def step(self):
         if self.always_accumulate:
             gradient_unlabeled = th.zeros(len(self.grad_hist_unlabeled))
+            gradient_unlabeled, self.grad_hist_unlabeled = ensure_on_same_device(
+                gradient_unlabeled, self.grad_hist_unlabeled)
         neg_grad_labels = self.grad_hist_unlabeled[:, 0]
         mask = self.unlabeled_cluster_weights.grad.data > 0
         relevant_neg = neg_grad_labels[mask]
