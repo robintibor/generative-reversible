@@ -186,6 +186,71 @@ def w2_distance_per_sample_loss(outs, directions, soft_targets, means_per_dim,
     return loss
 
 
+def log_kernel_density_estimation(X, weights_X, x, bandwidth, eps=1e-6):
+    # X are reference points / landmark/kernel points
+    # x points to determine densities for
+    constant = float(1 / np.sqrt(2 * np.pi))
+    diffs = X.unsqueeze(1) - x.unsqueeze(0)
+    diffs = diffs / bandwidth.unsqueeze(0).unsqueeze(0)
+    probs_X = weights_X / th.sum(weights_X)
+    exped = constant * th.exp(-(diffs * diffs) / 2)
+    pdf_per_dim = th.sum(exped * probs_X.unsqueeze(1).unsqueeze(2), dim=0) / bandwidth.unsqueeze(0)
+    log_kernel_densities = th.sum(th.log(pdf_per_dim + eps), dim=1)
+    return log_kernel_densities
+
+
+def kernel_density_loss(outs, directions, soft_targets, means_per_dim, stds_per_dim):
+    loss = 0
+    for i_cluster in range(len(means_per_dim)):
+        this_means = means_per_dim[i_cluster:i_cluster + 1]
+        this_stds = stds_per_dim[i_cluster:i_cluster + 1]
+        this_weights = soft_targets[:, i_cluster]
+        samples = sample_mixture_gaussian([len(outs) * 2], this_means, this_stds)
+        eps = 1e-6
+        # http://citeseerx.ist.psu.edu/viewdoc/download?doi=10.1.1.44.6770&rep=rep1&type=pdf page 12
+        # for bandwidth rule of thumb
+        bandwidth = 1.06 * (th.autograd.Variable(this_stds.data, requires_grad=False).squeeze() + eps) * (
+            th.sum(th.autograd.Variable(this_weights.data, requires_grad=False)) ** (-0.2))
+
+        log_kernel_pdfs = log_kernel_density_estimation(outs, this_weights,
+                                      samples, bandwidth)
+
+        log_gaussian_pdfs = log_gaussian_pdf_per_cluster(samples, this_means, (this_stds+eps)).squeeze()
+        #kl_div = th.mean(th.exp(log_kernel_pdfs) * (log_kernel_pdfs - log_gaussian_pdfs))
+        kl_div = th.mean(th.exp(log_gaussian_pdfs) * (log_gaussian_pdfs - log_kernel_pdfs))
+        loss = loss + kl_div
+        #pdf_diffs = th.exp(log_gaussian_pdfs) - th.exp(log_kernel_pdfs)
+        #mise = th.mean(pdf_diffs * pdf_diffs)
+        #loss  = loss + mise
+    return loss
+
+
+def kernel_density_loss_demeaned_phases(outs, directions, soft_targets, means_per_dim, stds_per_dim):
+    loss = 0
+    for i_cluster in range(len(means_per_dim)):
+        this_means = means_per_dim[i_cluster:i_cluster + 1]
+        this_stds = stds_per_dim[i_cluster:i_cluster + 1]
+        this_weights = soft_targets[:, i_cluster]
+        samples = sample_mixture_gaussian([len(outs) * 2], this_means, this_stds)
+        eps = 1e-6
+        # http://citeseerx.ist.psu.edu/viewdoc/download?doi=10.1.1.44.6770&rep=rep1&type=pdf page 12
+        # for bandwidth rule of thumb
+        bandwidth = 1.06 * (th.autograd.Variable(this_stds.data, requires_grad=False).squeeze() + eps) * (
+            th.sum(th.autograd.Variable(this_weights.data, requires_grad=False)) ** (-0.2))
+        this_outs = demean_phases_in_outs(outs, this_weights)
+        log_kernel_pdfs = log_kernel_density_estimation(this_outs, this_weights,
+                                      samples, bandwidth)
+
+        log_gaussian_pdfs = log_gaussian_pdf_per_cluster(samples, this_means, (this_stds+eps)).squeeze()
+        #kl_div = th.mean(th.exp(log_kernel_pdfs) * (log_kernel_pdfs - log_gaussian_pdfs))
+        kl_div = th.mean(th.exp(log_gaussian_pdfs) * (log_gaussian_pdfs - log_kernel_pdfs))
+        loss = loss + kl_div
+        #pdf_diffs = th.exp(log_gaussian_pdfs) - th.exp(log_kernel_pdfs)
+        #mise = th.mean(pdf_diffs * pdf_diffs)
+        #loss  = loss + mise
+    return loss
+
+
 def compute_all_i_cdfs(this_means, this_stds, sorted_weights, directions):
     transformed_means, transformed_stds = transform_gaussian_by_dirs(
         this_means, th.abs(this_stds), directions)
