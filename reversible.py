@@ -137,14 +137,18 @@ def w2_both(outs, directions, soft_targets,
 
 
 def w2_both_demeaned_phases(outs, directions, soft_targets,
-            means_per_dim, stds_per_dim):
+            means_per_dim, stds_per_dim, gaussianize_phases):
     loss = 0
+    directions = norm_and_var_directions(directions)
     for i_cluster in range(len(means_per_dim)):
         this_means = means_per_dim[i_cluster:i_cluster + 1]
         this_stds = stds_per_dim[i_cluster:i_cluster + 1]
         this_weights = soft_targets[:, i_cluster]
-        directions = norm_and_var_directions(directions)
-        this_outs = demean_phases_in_outs(outs, this_weights)
+        this_outs = set_phase_interval_around_mean_in_outs(
+            outs, means=this_means.squeeze())
+        if gaussianize_phases:
+            this_outs = uniform_to_gaussian_phases_in_outs(
+                this_outs,  means=this_means.squeeze())
         projected_samples = th.mm(this_outs, directions.t())
         sorted_samples, i_sorted = th.sort(projected_samples, dim=0)
         sorted_weights = th.stack([this_weights[i_sorted[:, i_dim]]
@@ -187,10 +191,36 @@ def w2_distance_per_sample_loss(outs, directions, soft_targets, means_per_dim,
 
 
 def log_kernel_density_estimation(X, weights_X, x, bandwidth, eps=1e-6):
+    return th.log(kernel_density_estimation(X, weights_X, x, bandwidth) + eps)
+
+
+def kernel_density_estimation(X, weights_X, x, bandwidth):
     # X are reference points / landmark/kernel points
     # x points to determine densities for
     constant = float(1 / np.sqrt(2 * np.pi))
     diffs = X.unsqueeze(1) - x.unsqueeze(0)
+    # see also http://www.buch-kromann.dk/tine/nonpar/Nonparametric_Density_Estimation_multidim.pdf
+    diffs = diffs / bandwidth.unsqueeze(0).unsqueeze(0)
+    probs_X = weights_X / th.sum(weights_X)
+    exped = constant * th.exp(-(diffs * diffs) / 2)
+    # prod over dimensions
+    pdf_per_reference = th.prod(exped / bandwidth.unsqueeze(0).unsqueeze(0),
+                                dim=2)
+
+    #pdf_per_reference = th.exp(th.sum(th.log(exped / bandwidth.unsqueeze(0).unsqueeze(0)),
+    #                            dim=2))
+    # now reference points x queried points (X times x)
+    pdf_per_point = th.sum(pdf_per_reference * probs_X.unsqueeze(1), dim=0)
+
+    return pdf_per_point
+
+
+def log_kernel_density_estimation_old(X, weights_X, x, bandwidth, eps=1e-6):
+    # X are reference points / landmark/kernel points
+    # x points to determine densities for
+    constant = float(1 / np.sqrt(2 * np.pi))
+    diffs = X.unsqueeze(1) - x.unsqueeze(0)
+    # see also http://www.buch-kromann.dk/tine/nonpar/Nonparametric_Density_Estimation_multidim.pdf
     diffs = diffs / bandwidth.unsqueeze(0).unsqueeze(0)
     probs_X = weights_X / th.sum(weights_X)
     exped = constant * th.exp(-(diffs * diffs) / 2)
@@ -199,56 +229,172 @@ def log_kernel_density_estimation(X, weights_X, x, bandwidth, eps=1e-6):
     return log_kernel_densities
 
 
-def kernel_density_loss(outs, directions, soft_targets, means_per_dim, stds_per_dim):
+def kernel_density_loss(outs, directions, soft_targets, means_per_dim, stds_per_dim,
+                        demean_phases=False, gaussianize_phases=False):
+    # have a look here : https://stats.stackexchange.com/questions/6907/an-adaptation-of-the-kullback-leibler-distance/6937#6937
+    # for symmetric alternative
     loss = 0
     for i_cluster in range(len(means_per_dim)):
+        n_samples = len(outs)
         this_means = means_per_dim[i_cluster:i_cluster + 1]
         this_stds = stds_per_dim[i_cluster:i_cluster + 1]
         this_weights = soft_targets[:, i_cluster]
-        samples = sample_mixture_gaussian([len(outs) * 2], this_means, this_stds)
+        samples = sample_mixture_gaussian([n_samples], this_means, this_stds)
         eps = 1e-6
         # http://citeseerx.ist.psu.edu/viewdoc/download?doi=10.1.1.44.6770&rep=rep1&type=pdf page 12
         # for bandwidth rule of thumb
-        bandwidth = 1.06 * (th.autograd.Variable(this_stds.data, requires_grad=False).squeeze() + eps) * (
+        bandwidth = 1.06 * (th.autograd.Variable(this_stds.data + eps, requires_grad=False).squeeze() + eps) * (
             th.sum(th.autograd.Variable(this_weights.data, requires_grad=False)) ** (-0.2))
-
-        log_kernel_pdfs = log_kernel_density_estimation(outs, this_weights,
-                                      samples, bandwidth)
-
-        log_gaussian_pdfs = log_gaussian_pdf_per_cluster(samples, this_means, (this_stds+eps)).squeeze()
-        #kl_div = th.mean(th.exp(log_kernel_pdfs) * (log_kernel_pdfs - log_gaussian_pdfs))
-        kl_div = th.mean(th.exp(log_gaussian_pdfs) * (log_gaussian_pdfs - log_kernel_pdfs))
-        loss = loss + kl_div
-        #pdf_diffs = th.exp(log_gaussian_pdfs) - th.exp(log_kernel_pdfs)
-        #mise = th.mean(pdf_diffs * pdf_diffs)
-        #loss  = loss + mise
-    return loss
-
-
-def kernel_density_loss_demeaned_phases(outs, directions, soft_targets, means_per_dim, stds_per_dim):
-    loss = 0
-    for i_cluster in range(len(means_per_dim)):
-        this_means = means_per_dim[i_cluster:i_cluster + 1]
-        this_stds = stds_per_dim[i_cluster:i_cluster + 1]
-        this_weights = soft_targets[:, i_cluster]
-        samples = sample_mixture_gaussian([len(outs) * 2], this_means, this_stds)
-        eps = 1e-6
-        # http://citeseerx.ist.psu.edu/viewdoc/download?doi=10.1.1.44.6770&rep=rep1&type=pdf page 12
-        # for bandwidth rule of thumb
-        bandwidth = 1.06 * (th.autograd.Variable(this_stds.data, requires_grad=False).squeeze() + eps) * (
-            th.sum(th.autograd.Variable(this_weights.data, requires_grad=False)) ** (-0.2))
-        this_outs = demean_phases_in_outs(outs, this_weights)
+        if demean_phases:
+            this_outs = set_phase_interval_around_mean_in_outs(
+                outs, means=this_means.squeeze(0))
+            if gaussianize_phases:
+                this_outs = uniform_to_gaussian_phases_in_outs(
+                    this_outs, means=this_means.squeeze(0))
+        else:
+            assert not gaussianize_phases
+            this_outs = outs
         log_kernel_pdfs = log_kernel_density_estimation(this_outs, this_weights,
                                       samples, bandwidth)
 
-        log_gaussian_pdfs = log_gaussian_pdf_per_cluster(samples, this_means, (this_stds+eps)).squeeze()
-        #kl_div = th.mean(th.exp(log_kernel_pdfs) * (log_kernel_pdfs - log_gaussian_pdfs))
-        kl_div = th.mean(th.exp(log_gaussian_pdfs) * (log_gaussian_pdfs - log_kernel_pdfs))
-        loss = loss + kl_div
+        # squeeze empty cluster dim
+        log_gaussian_pdfs = log_gaussian_pdf_per_cluster(samples, this_means, (this_stds+eps)).squeeze(1)
+        kl_div_k_g = th.exp(log_kernel_pdfs) * (log_kernel_pdfs - log_gaussian_pdfs)
+        kl_div_g_k = th.exp(log_gaussian_pdfs) * (log_gaussian_pdfs - log_kernel_pdfs)
+        #loss = loss + kl_div_g_k
+        loss = loss + th.mean(th.max(kl_div_g_k, kl_div_k_g))
         #pdf_diffs = th.exp(log_gaussian_pdfs) - th.exp(log_kernel_pdfs)
         #mise = th.mean(pdf_diffs * pdf_diffs)
         #loss  = loss + mise
     return loss
+
+
+def kernel_density_loss_demeaned_phases(outs, directions, soft_targets, means_per_dim, stds_per_dim, gaussianize_phases=False):
+    return kernel_density_loss(outs, directions, soft_targets, means_per_dim, stds_per_dim, demean_phases=True,
+                               gaussianize_phases=gaussianize_phases)
+
+
+def standard_gaussian_icdf(cdfs):
+    # see https://en.wikipedia.org/wiki/Normal_distribution#Quantile_function
+    return th.erfinv(2 * cdfs - 1) * np.sqrt(2.0)
+
+
+def standard_gaussian_cdf(vals):
+    #see https://en.wikipedia.org/wiki/Normal_distribution#Cumulative_distribution_function
+    return 0.5 * (1 + th.erf(vals / (np.sqrt(2))))
+
+
+def noncentral_chi_2_cdf_approx(x, k, lam):
+    # see https://en.wikipedia.org/wiki/Noncentral_chi-squared_distribution#Approximation
+    # Sankaran , M. (1959). "On the non-central chi-squared distribution", Biometrika 46, 235–237
+    """Test like that (visually):
+    rng = RandomState(3434)
+    xs = rng.randn(10000,3)
+    diff_from_origin = 2
+    amps = np.sum(np.square(xs - np.ones((1,xs.shape[1]))* diff_from_origin), axis=1)
+    vals = np.linspace(0,20,100)
+    cdfs = [np.mean(amps < r) for r in vals]
+    lam = np.square(diff_from_origin) * xs.shape[1]*1.0
+    k = xs.shape[1]
+    cdfs_2 = noncentral_chi_2_cdf_approx(np_to_var(vals), k, lam)
+    plt.plot(vals, cdfs)
+    plt.plot(vals, var_to_np(cdfs_2))"""
+    kplus2lam = k + 2*lam
+    kpluslam = k + lam
+    h = 1 - ((2/3.0) * ((kpluslam / kplus2lam) * ((k + 3*lam) / kplus2lam)))
+    p = kplus2lam / (kpluslam * kpluslam)
+    m = (h-1) * (1-3*h)
+    # upper sum first term
+    u1t = (x /(kpluslam)) ** h
+    u2t = (1 + h*p*(h-1-0.5*(2-h)*m*p))
+    ut = u1t - u2t
+    lt = h * np.sqrt(2 * p) * (1+0.5*m*p)
+    return standard_gaussian_cdf(ut/lt)
+
+
+def noncentral_chi_2_icdf_approx(cdf,k,lam):
+    # On paper inverted from approx cdf function
+    ratio = standard_gaussian_icdf(cdf)
+    kplus2lam = k + 2*lam
+    kpluslam = k + lam
+    h = 1 - ((2/3.0) * ((kpluslam / kplus2lam) * ((k + 3*lam) / kplus2lam)))
+    p = kplus2lam / (kpluslam * kpluslam)
+    m = (h-1) * (1-3*h)
+    inner = ratio * h * th.sqrt(2*p) *(1+0.5*m*p) + 1 +  h*p*(h-1-0.5*(2-h)*m*p)
+    # necessary, unfortunately approximation can become negative here
+    inner = th.clamp(inner, min=0)
+    second_part = inner ** (1/h)
+    vals = kpluslam * (second_part)
+    return vals
+
+
+def mahabalonis_distance_loss(outs, mean, std, n_samples=100, eps=1e-6):
+    orig_samples = th.autograd.Variable(th.randn(n_samples, len(mean)))
+    samples = (orig_samples * std.unsqueeze(0)) + mean.unsqueeze(0)
+    diffs = outs.unsqueeze(0) - samples.unsqueeze(1)
+    # samples x outs x dims
+    # transform to mahabalonis
+    diffs = diffs / th.clamp(std, min=eps).unsqueeze(0).unsqueeze(1)
+    diffs = th.sum((diffs * diffs), dim=2)
+    # samples x dims
+    noncentrality_per_sample = th.sum((orig_samples * orig_samples), dim=1)
+
+    sorted_diffs, _ = th.sort(diffs, dim=1)
+
+    fake_weights = th.autograd.Variable(th.ones(len(outs)))
+
+    n_virtual_samples = th.sum(fake_weights)
+    start = 1 / (n_virtual_samples)
+    wanted_sum = 1 - (2 / (n_virtual_samples))
+    probs = fake_weights * wanted_sum / n_virtual_samples
+    empirical_cdf = start + th.cumsum(probs, dim=0)
+    k = mean.size()[0]
+    expected_icdf = noncentral_chi_2_icdf_approx(
+        empirical_cdf, k=np_to_var(k, dtype=np.float32).unsqueeze(1),
+        lam=noncentrality_per_sample.unsqueeze(1))
+    loss = th.mean(th.sqrt(th.mean(th.abs(expected_icdf - sorted_diffs), dim=1)))
+    return loss
+
+
+def uniform_to_gaussian_phases_in_outs(outs_with_demeaned_phases, means):
+    n_chans = outs_with_demeaned_phases.size()[1]
+    assert n_chans % 2 == 0
+    amps = outs_with_demeaned_phases[:, :n_chans // 2]
+    phases = outs_with_demeaned_phases[:, n_chans // 2:]
+    mean_phases = means[n_chans // 2:]
+    gauss_phases = uniform_to_gaussian_phases(phases, mean_phases)
+    outs = th.cat((amps, gauss_phases), dim=1)
+    return outs
+
+
+def uniform_to_gaussian_phases(phases, mean_phases):
+    eps = 1e-6#1e-7#1e-7 # 1e-8 results in -inf for icdf of gaussian.....
+    start = mean_phases - np.pi - eps
+    stop = mean_phases + np.pi + eps
+    cdfs = (phases - start.unsqueeze(0)) / (stop - start).unsqueeze(0)
+    icdfs = standard_gaussian_icdf(cdfs)
+    return (icdfs * (stop - start).unsqueeze(0)) + mean_phases.unsqueeze(0)
+
+
+def gaussian_to_uniform_phases_in_outs(outs_with_gaussian_phases, means):
+    n_chans = outs_with_gaussian_phases.size()[1]
+    assert n_chans % 2 == 0
+    amps = outs_with_gaussian_phases[:, :n_chans // 2]
+    phases = outs_with_gaussian_phases[:, n_chans // 2:]
+    mean_phases = means[n_chans // 2:]
+    uni_phases = gaussian_to_uniform_phases(phases, mean_phases)
+    outs = th.cat((amps, uni_phases), dim=1)
+    return outs
+
+
+def gaussian_to_uniform_phases(phases, mean_phases):
+    eps = 1e-6#1e-7#1e-7 # 1e-8 results in -inf for icdf of gaussian.....
+    start = mean_phases - np.pi - eps
+    stop = mean_phases + np.pi + eps
+    icdfs = (phases - mean_phases.unsqueeze(0)) / (stop - start).unsqueeze(0)
+    cdfs = standard_gaussian_cdf(icdfs)
+    uni_phases = (cdfs * (stop - start).unsqueeze(0)) + start.unsqueeze(0)
+    return uni_phases
 
 
 def compute_all_i_cdfs(this_means, this_stds, sorted_weights, directions):
@@ -571,6 +717,26 @@ def invert(feature_model, features):
     return features
 
 
+def init_std_mean(feature_model, inputs, targets, means_per_dim, stds_per_dim,
+                  set_phase_interval):
+    outs = feature_model(inputs)
+    for i_cluster in range(len(means_per_dim)):
+        n_elems = len(th.nonzero(targets[:, i_cluster] == 1))
+        this_weights = targets[:, i_cluster]
+        if set_phase_interval:
+            this_outs = set_phase_interval_around_mean_in_outs(
+                outs, this_weights=this_weights)
+
+        this_outs = this_outs[(this_weights == 1).unsqueeze(1)].resize(
+            n_elems, outs.size()[1])
+
+        means = th.mean(this_outs, dim=0)
+        # this_outs = uniform_to_gaussian_phases_in_outs(this_outs,means)
+        stds = th.std(this_outs, dim=0)
+        means_per_dim.data[i_cluster] = means.data
+        stds_per_dim.data[i_cluster] = stds.data
+
+
 class AmplitudePhase(th.nn.Module):
     def __init__(self):
         super(AmplitudePhase, self).__init__()
@@ -601,29 +767,45 @@ def amp_phase_to_x_y(amps, phases):
 # Not used, delete?:
 def demean_phases(phases):
     x,y = th.cos(phases), th.sin(phases)
-    mean_phase = th.atan2(th.mean(y), th.mean(x))
+    mean_phase = th.atan2(th.mean(y, dim=0), th.mean(x, dim=0))
     demeaned_phases = ((phases - mean_phase + np.pi) % (2 * np.pi)) - np.pi
     return demeaned_phases
 
 
+# Not used, delete?:
 def unroll_phases(phases):
     x,y = th.cos(phases), th.sin(phases)
-    mean_phase = th.atan2(th.mean(y), th.mean(x))
+    mean_phase = th.atan2(th.mean(y, dim=0), th.mean(x, dim=0))
     demeaned_phases = ((phases - mean_phase + np.pi) % (2 * np.pi)) - np.pi + mean_phase
     return demeaned_phases
 
 
-def demean_phases_in_outs(outs, this_weights):
+def compute_mean_phase(phases, this_weights):
+    x, y = th.cos(phases), th.sin(phases)
+    this_probs = this_weights / th.sum(this_weights)
+    mean_x = th.sum(this_probs.unsqueeze(1) * x, dim=0)
+    mean_y = th.sum(this_probs.unsqueeze(1) * y, dim=0)
+    mean_phase = th.atan2(mean_y, mean_x)
+    return mean_phase
+
+
+def set_phase_interval_around_mean(phases, mean_phase):
+    mean_phase = mean_phase.unsqueeze(0)
+    return ((phases - mean_phase + np.pi) % (2 * np.pi)) - np.pi + mean_phase
+
+
+def set_phase_interval_around_mean_in_outs(outs, this_weights=None, means=None,):
+    assert (this_weights is None) != (means is None)
     n_chans = outs.size()[1]
     assert n_chans % 2 == 0
     amps = outs[:, :n_chans // 2]
     phases = outs[:, n_chans // 2:]
-    x,y = th.cos(phases), th.sin(phases)
-    this_probs = this_weights / th.sum(this_weights)
-    mean_x = th.sum(this_probs.unsqueeze(1) * x)
-    mean_y = th.sum(this_probs.unsqueeze(1) * y)
-    mean_phase = th.atan2(mean_y, mean_x)
-    demeaned_phases = ((phases - mean_phase + np.pi) % (2 * np.pi)) - np.pi + mean_phase
+    if this_weights is not None:
+        mean_phase = compute_mean_phase(phases, this_weights)
+    else:
+        assert means.size()[0] == n_chans
+        mean_phase = means[n_chans // 2:]
+    demeaned_phases = set_phase_interval_around_mean(phases, mean_phase)
     new_outs = th.cat((amps, demeaned_phases), dim=1)
     return new_outs
 
@@ -701,12 +883,17 @@ class GaussianMeanDistances(th.nn.Module):
 def get_inputs_from_reverted_samples(n_inputs, means_per_dim, stds_per_dim,
                                      weights_per_cluster,
                                      feature_model,
-                                     to_4d=True):
+                                     to_4d=True,
+                                     gaussian_to_uniform_phases=False):
     feature_model.eval()
     sizes = sizes_from_weights(n_inputs, var_to_np(weights_per_cluster))
     gauss_samples = sample_mixture_gaussian(sizes, means_per_dim, stds_per_dim)
     if to_4d:
         gauss_samples = gauss_samples.unsqueeze(2).unsqueeze(3)
+    if gaussian_to_uniform_phases:
+        assert len(means_per_dim) == 1
+        gauss_samples = gaussian_to_uniform_phases_in_outs(
+            gauss_samples, means_per_dim.squeeze(0))
     rec_var = invert(feature_model, gauss_samples)
     rec_examples = var_to_np(rec_var).squeeze()
     return rec_examples, gauss_samples
@@ -810,8 +997,8 @@ def log_gaussian_pdf_per_cluster(X, means_per_dim, stds_per_dim, eps=1e-6):
     log_pdf_per_dim_per_cluster = (
         -(demeaned_X * demeaned_X) / (2 * squared_std.t().unsqueeze(0)))
     # log_pdf_per_dim_per_cluster are examples x dims x clusters
-    log_pdf_per_dim_per_cluster = th.sum(log_pdf_per_dim_per_cluster, dim=1)
-    log_pdf_per_cluster = log_pdf_per_dim_per_cluster - subtractors.unsqueeze(0)
+    log_pdf_per_cluster = th.sum(log_pdf_per_dim_per_cluster, dim=1)
+    log_pdf_per_cluster = log_pdf_per_cluster - subtractors.unsqueeze(0)
     return log_pdf_per_cluster
 
 
