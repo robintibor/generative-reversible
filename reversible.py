@@ -339,7 +339,7 @@ def mahabalonis_distance_loss(outs, mean, std, n_samples=100, eps=1e-6):
     fake_weights = th.autograd.Variable(th.ones(len(outs)))
 
     n_virtual_samples = th.sum(fake_weights)
-    start = 1 / (n_virtual_samples)
+    start = 1 / (2 * n_virtual_samples)
     wanted_sum = 1 - (2 / (n_virtual_samples))
     probs = fake_weights * wanted_sum / n_virtual_samples
     empirical_cdf = start + th.cumsum(probs, dim=0)
@@ -372,7 +372,7 @@ def mahabalonis_distance_loss_weighted(outs, weights, mean, std, n_samples=100,
     # sorted is samples x outs
 
     n_virtual_samples = th.sum(weights)
-    start = 1 / (n_virtual_samples)
+    start = 1 / (2 * n_virtual_samples)
     wanted_sum = 1 - (2 / (n_virtual_samples))
     probs = weights * wanted_sum / n_virtual_samples
 
@@ -468,7 +468,7 @@ def compute_all_i_cdfs(this_means, this_stds, sorted_weights, directions):
         this_means, th.abs(this_stds), directions)
 
     n_virtual_samples = th.sum(sorted_weights[:, 0])
-    start = 1 / (n_virtual_samples)
+    start = 1 / (2 * n_virtual_samples)
     wanted_sum = 1 - (2 / (n_virtual_samples))
     probs = sorted_weights * wanted_sum / n_virtual_samples
     empirical_cdf = start + th.cumsum(probs, dim=0)
@@ -499,7 +499,7 @@ def w2_normalized_both(outs, directions, soft_targets,
         transformed_means, transformed_stds = transform_gaussian_by_dirs(
             this_means, th.abs(this_stds), directions)
         n_virtual_samples = th.sum(sorted_weights[:, 0])  # CHANGE
-        start = 1 / (n_virtual_samples)
+        start = 1 / (2 * n_virtual_samples)
         wanted_sum = 1 - (2 / (n_virtual_samples))
         probs = sorted_weights * wanted_sum / n_virtual_samples
         empirical_cdf = start + th.cumsum(probs, dim=0)
@@ -538,7 +538,7 @@ def w2_for_dist_w2_normalized_for_model(outs, directions, soft_targets,
                                    for i_dim in range(i_sorted.size()[1])],
                                   dim=1)  # CHANGE
         n_virtual_samples = th.sum(sorted_weights[:, 0])  # CHANGE
-        start = 1 / (n_virtual_samples)
+        start = 1 / (2 * n_virtual_samples)
         wanted_sum = 1 - (2 / (n_virtual_samples))
         probs = sorted_weights * wanted_sum / n_virtual_samples
         empirical_cdf = start + th.cumsum(probs, dim=0)
