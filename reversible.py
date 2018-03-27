@@ -69,7 +69,7 @@ class GenerativeRevTrainer(object):
 
     def train_epoch(self, inputs, targets, inputs_u, linear_weights_u,
                     trans_loss_function,
-                    directions_adv, optimizer_adv, n_dir_matrices=1):
+                    directions_adv, n_dir_matrices=1):
         loss = 0
         n_examples = 0
         for batch_X, batch_y in self.iterator.get_batches(
@@ -78,12 +78,13 @@ class GenerativeRevTrainer(object):
                                           cuda=False)
                         for _ in range(n_dir_matrices)]
             directions = th.cat(dir_mats, dim=0)
+            if directions_adv is not None:
+                directions = th.cat((directions, directions_adv), dim=0)
             #            directions = sample_directions(self.means_per_dim.size()[1], True, cuda=False)
             batch_loss = train_on_batch(batch_X, self.model, self.means_per_dim,
                                         self.stds_per_dim,
                                         batch_y, self.optimizer, directions,
-                                        trans_loss_function,
-                                        directions_adv, optimizer_adv)
+                                        trans_loss_function)
             loss = loss + batch_loss * len(batch_X)
             n_examples = n_examples + batch_X.size()[0]
         mean_loss = var_to_np(loss / n_examples)[0]
@@ -92,25 +93,18 @@ class GenerativeRevTrainer(object):
 
 def train_on_batch(batch_X, model, means_per_dim, stds_per_dim, soft_targets,
                    optimizer,
-                   directions, trans_loss_function, directions_adv,
-                   optimizer_adv,
+                   directions, trans_loss_function,
                    ):
     if means_per_dim.is_cuda:
         batch_X = batch_X.cuda()
         soft_targets = soft_targets.cuda()
-    if directions_adv is not None:
-        directions = th.cat((directions, directions_adv), dim=0)
+
     batch_outs = model(batch_X)
     trans_loss = trans_loss_function(batch_outs, directions, soft_targets,
                                      means_per_dim, stds_per_dim)
     optimizer.zero_grad()
-    if optimizer_adv is not None:
-        optimizer_adv.zero_grad()
     trans_loss.backward()
     optimizer.step()
-    if optimizer_adv is not None:
-        directions_adv.grad.data.neg_()
-        optimizer_adv.step()
     return trans_loss
 
 
@@ -358,15 +352,19 @@ def mahabalonis_distance_loss(outs, mean, std, n_samples=100, eps=1e-6):
 
 
 def mahabalonis_distance_loss_weighted(outs, weights, mean, std, n_samples=100,
-                                       eps=1e-6):
+                                       eps=1e-6, adv_samples=None):
     # per out sample
     orig_samples = th.autograd.Variable(th.randn(n_samples, len(mean)))
+    if adv_samples is not None:
+        orig_samples = th.cat((orig_samples, adv_samples), dim=0)
+
     samples = (orig_samples * std.unsqueeze(0)) + mean.unsqueeze(0)
     diffs = outs.unsqueeze(0) - samples.unsqueeze(1)
     # samples x outs x dims
     # transform to mahabalonis
     diffs = diffs / th.clamp(std, min=eps).unsqueeze(0).unsqueeze(1)
     diffs = th.sum((diffs * diffs), dim=2)
+
     # samples x outs
     noncentrality_per_sample = th.sum((orig_samples * orig_samples), dim=1)
 
@@ -385,7 +383,7 @@ def mahabalonis_distance_loss_weighted(outs, weights, mean, std, n_samples=100,
     k = mean.size()[0]
     expected_icdf = noncentral_chi_2_icdf_approx(
         empirical_cdf, k=np_to_var(k, dtype=np.float32).unsqueeze(1),
-        lam=noncentrality_per_sample.unsqueeze(1))
+        lam=noncentrality_per_sample.unsqueeze(1).detach()) # detach since otherwise grad is NaN
     diff_diff = th.abs(expected_icdf - sorted_diffs)
     # still samples x outs
 
@@ -402,7 +400,7 @@ def mahabalonis_distance_loss_weighted(outs, weights, mean, std, n_samples=100,
 
 def maha_dist_per_cluster(outs, soft_targets, means_per_dim, stds_per_dim,
                           demean_phases=False, gaussianize_phases=False,
-                          n_samples=100):
+                          n_samples=100, adv_samples=None):
     loss = 0
     for i_cluster in range(len(means_per_dim)):
         this_means = means_per_dim[i_cluster]
@@ -417,7 +415,8 @@ def maha_dist_per_cluster(outs, soft_targets, means_per_dim, stds_per_dim,
         else:
             assert not gaussianize_phases
         this_loss = mahabalonis_distance_loss_weighted(
-            this_outs, this_weights, this_means, this_stds, n_samples=n_samples)
+            this_outs, this_weights, this_means, this_stds, n_samples=n_samples,
+            adv_samples=adv_samples)
 
         loss = loss + this_loss
     return loss
@@ -1533,7 +1532,6 @@ def train_epoch_per_class(
     examples_per_batch = get_batches_equal_classes(var_to_np(targets), 2, rng,
                                                    batch_size)
     for i_examples in examples_per_batch:
-        # print("weights_per_cluster epoch", weights_per_cluster)
         batch_X = inputs[th.LongTensor(i_examples)]
         batch_y = targets[th.LongTensor(i_examples)]
         (trans_loss, threshold_l1_penalty, target_loss,
