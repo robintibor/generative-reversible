@@ -422,6 +422,94 @@ def maha_dist_per_cluster(outs, soft_targets, means_per_dim, stds_per_dim,
     return loss
 
 
+def radial_dist_per_cluster(outs, soft_targets, means_per_dim, stds_per_dim,
+                          demean_phases=False, gaussianize_phases=False,
+                          n_samples=100, adv_samples=None,
+                            n_interpolation_samples='n_outs',
+                            weight_by_expected_diffs=True):
+    loss = 0
+    for i_cluster in range(len(means_per_dim)):
+        this_outs = outs
+        this_means = means_per_dim[i_cluster]
+        this_stds = stds_per_dim[i_cluster]
+        this_weights = soft_targets[:, i_cluster]
+        if demean_phases:
+            this_outs = set_phase_interval_around_mean_in_outs(
+                this_outs, means=this_means.squeeze(0).detach())
+            if gaussianize_phases:
+                this_outs = uniform_to_gaussian_phases_in_outs(
+                    this_outs, means=this_means.squeeze(0))
+        else:
+            assert not gaussianize_phases
+        this_loss = radial_distance_loss(
+            this_outs, this_weights, this_means, this_stds, n_samples=n_samples,
+            adv_samples=adv_samples, n_interpolation_samples=n_interpolation_samples,
+            weight_by_expected_diffs=weight_by_expected_diffs)
+
+        loss = loss + this_loss
+    return loss
+
+
+def radial_distance_loss(outs, weights, mean, std, n_samples=100,
+                         adv_samples=None,
+                         n_interpolation_samples='n_outs',
+                         weight_by_expected_diffs=True):
+    if n_interpolation_samples == 'n_outs':
+        n_interpolation_samples = len(outs)
+    orig_samples = th.autograd.Variable(th.randn(n_samples, len(mean)))
+    samples = (orig_samples * std.unsqueeze(0)) + mean.unsqueeze(0)
+    if adv_samples is not None:
+        samples = th.cat((samples, adv_samples), dim=0)
+    # compute expected w2 distance per sample
+    # to weight the loss
+    demeaned_samples = samples - mean.unsqueeze(0)
+    noncentrality_per_sample = th.sum((demeaned_samples *demeaned_samples), dim=1)
+    expected_diffs = th.sqrt(noncentrality_per_sample + th.sum(std * std).unsqueeze(0))
+    expected_diffs = expected_diffs / th.sum(expected_diffs)
+    if not weight_by_expected_diffs:
+        expected_diffs = expected_diffs * 0 + 1
+    diffs = outs.unsqueeze(0) - samples.unsqueeze(1)
+    diffs = th.sum((diffs * diffs), dim=2)
+
+
+    sorted_diffs, i_sorted = th.sort(diffs, dim=1)
+    n_virtual_samples = th.sum(weights)
+    start = 1 / (2 * n_virtual_samples)
+    wanted_sum = 1 - (2 / (n_virtual_samples))
+    probs = weights * wanted_sum / n_virtual_samples
+
+    sorted_probs = th.stack([probs[i_sorted[i_sample]]
+                             for i_sample in range(len(samples))],
+                            dim=0)
+    empirical_cdf = start + th.cumsum(sorted_probs, dim=1)
+
+    ref_samples = (th.autograd.Variable(
+        th.randn(n_interpolation_samples, len(mean))) * std.unsqueeze(0)) + (
+                      mean.unsqueeze(0))
+    reference_diffs = ref_samples.unsqueeze(0) - samples.unsqueeze(1)
+    reference_diffs = th.sum((reference_diffs * reference_diffs), dim=2)
+    ref_sorted_diffs, _ = th.sort(reference_diffs, dim=1)
+    grid_x = (empirical_cdf - 0.5) * 2
+    # samples x reference samples
+    grid_y = grid_x.detach() * 0
+    grid = th.stack((grid_y, grid_x), dim=2).unsqueeze(2)
+    # samples x reference samples x 1 x 2
+    ref_interpolated_diffs = th.nn.functional.grid_sample(
+        ref_sorted_diffs.unsqueeze(1).unsqueeze(3), grid)
+    ref_interpolated_diffs = ref_interpolated_diffs.squeeze(3).squeeze(1)
+    diff_diff = th.abs(ref_interpolated_diffs - sorted_diffs)
+    # still samples x outs
+    # probs simple without changing for cdf wanted sum...
+    probs_simple = weights / th.sum(weights)
+    sorted_probs_simple = th.stack([probs_simple[i_sorted[i_sample]]
+                                    for i_sample in range(len(samples))],
+                                   dim=0)
+    diff_diff = diff_diff * sorted_probs_simple
+    # sum over weighted outs, then norm by expected diff
+    loss = th.mean(th.sqrt(th.sum(diff_diff, dim=1)) / expected_diffs)
+    return loss
+
+
 def uniform_to_gaussian_phases_in_outs(outs_with_demeaned_phases, means):
     n_chans = outs_with_demeaned_phases.size()[1]
     assert n_chans % 2 == 0
