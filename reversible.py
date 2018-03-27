@@ -131,6 +131,7 @@ def w2_both(outs, directions, soft_targets,
                                         directions)
 
         diffs = all_i_cdfs - sorted_samples
+        # why times weights and not times probs?
         this_loss = th.sqrt(th.mean(diffs * diffs * sorted_weights))
         loss = loss + this_loss
     return loss
@@ -145,10 +146,10 @@ def w2_both_demeaned_phases(outs, directions, soft_targets,
         this_stds = stds_per_dim[i_cluster:i_cluster + 1]
         this_weights = soft_targets[:, i_cluster]
         this_outs = set_phase_interval_around_mean_in_outs(
-            outs, means=this_means.squeeze())
+            outs, means=this_means.squeeze(0))
         if gaussianize_phases:
             this_outs = uniform_to_gaussian_phases_in_outs(
-                this_outs,  means=this_means.squeeze())
+                this_outs,  means=this_means.squeeze(0))
         projected_samples = th.mm(this_outs, directions.t())
         sorted_samples, i_sorted = th.sort(projected_samples, dim=0)
         sorted_weights = th.stack([this_weights[i_sorted[:, i_dim]]
@@ -353,6 +354,72 @@ def mahabalonis_distance_loss(outs, mean, std, n_samples=100, eps=1e-6):
         empirical_cdf, k=np_to_var(k, dtype=np.float32).unsqueeze(1),
         lam=noncentrality_per_sample.unsqueeze(1))
     loss = th.mean(th.sqrt(th.mean(th.abs(expected_icdf - sorted_diffs), dim=1)))
+    return loss
+
+
+def mahabalonis_distance_loss_weighted(outs, weights, mean, std, n_samples=100,
+                                       eps=1e-6):
+    # per out sample
+    orig_samples = th.autograd.Variable(th.randn(n_samples, len(mean)))
+    samples = (orig_samples * std.unsqueeze(0)) + mean.unsqueeze(0)
+    diffs = outs.unsqueeze(0) - samples.unsqueeze(1)
+    # samples x outs x dims
+    # transform to mahabalonis
+    diffs = diffs / th.clamp(std, min=eps).unsqueeze(0).unsqueeze(1)
+    diffs = th.sum((diffs * diffs), dim=2)
+    # samples x outs
+    noncentrality_per_sample = th.sum((orig_samples * orig_samples), dim=1)
+
+    sorted_diffs, i_sorted = th.sort(diffs, dim=1)
+    # sorted is samples x outs
+
+    n_virtual_samples = th.sum(weights)
+    start = 1 / (n_virtual_samples)
+    wanted_sum = 1 - (2 / (n_virtual_samples))
+    probs = weights * wanted_sum / n_virtual_samples
+
+    sorted_probs = th.stack([probs[i_sorted[i_sample]]
+                               for i_sample in range(len(samples))],
+                              dim=0)
+    empirical_cdf = start + th.cumsum(sorted_probs, dim=1)
+    k = mean.size()[0]
+    expected_icdf = noncentral_chi_2_icdf_approx(
+        empirical_cdf, k=np_to_var(k, dtype=np.float32).unsqueeze(1),
+        lam=noncentrality_per_sample.unsqueeze(1))
+    diff_diff = th.abs(expected_icdf - sorted_diffs)
+    # still samples x outs
+
+    # probs simple without changing for cdf wanted sum...
+    probs_simple = weights / th.sum(weights)
+    sorted_probs_simple = th.stack([probs_simple[i_sorted[i_sample]]
+                               for i_sample in range(len(samples))],
+                              dim=0)
+    diff_diff = diff_diff * sorted_probs_simple
+    # sum over weighted outs
+    loss = th.mean(th.sqrt(th.sum(diff_diff, dim=1)))
+    return loss
+
+
+def maha_dist_per_cluster(outs, soft_targets, means_per_dim, stds_per_dim,
+                          demean_phases=False, gaussianize_phases=False,
+                          n_samples=100):
+    loss = 0
+    for i_cluster in range(len(means_per_dim)):
+        this_means = means_per_dim[i_cluster]
+        this_stds = stds_per_dim[i_cluster]
+        this_weights = soft_targets[:, i_cluster]
+        if demean_phases:
+            this_outs = set_phase_interval_around_mean_in_outs(
+                outs, means=this_means.squeeze(0).detach())
+            if gaussianize_phases:
+                this_outs = uniform_to_gaussian_phases_in_outs(
+                    this_outs, means=this_means.squeeze(0))
+        else:
+            assert not gaussianize_phases
+        this_loss = mahabalonis_distance_loss_weighted(
+            this_outs, this_weights, this_means, this_stds, n_samples=n_samples)
+
+        loss = loss + this_loss
     return loss
 
 
