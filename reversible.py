@@ -27,6 +27,9 @@ class GenerativeIterator(object):
                 i_add = self.rng.choice(np.arange(len(inputs)), size=n_missing,
                                    replace=False)
                 i_supervised = np.concatenate((i_supervised, i_add))
+        longtype = th.LongTensor
+        if inputs.is_cuda:
+            longtype = th.cuda.LongTensor
         if inputs_u is not None:
             supervised_batch_size = int(np.round(self.batch_size *
                                                  (len(i_supervised) / float(
@@ -42,10 +45,10 @@ class GenerativeIterator(object):
             # or some random examples as another batch
             for batch_i_s, batch_i_u in zip(batches_supervised,
                                             batches_unsupervised):
-                batch_X_s = inputs[th.LongTensor(batch_i_s)]
-                batch_X_u = inputs_u[th.LongTensor(batch_i_u)]
-                batch_y_s = targets[th.LongTensor(batch_i_s)]
-                batch_y_u = linear_weights_u[th.LongTensor(batch_i_u)]
+                batch_X_s = inputs[longtype(batch_i_s)]
+                batch_X_u = inputs_u[longtype(batch_i_u)]
+                batch_y_s = targets[longtype(batch_i_s)]
+                batch_y_u = linear_weights_u[longtype(batch_i_u)]
                 batch_y_u = th.nn.functional.softmax(batch_y_u, dim=1)
                 batch_X = th.cat((batch_X_s, batch_X_u), dim=0)
                 batch_y = th.cat((batch_y_s, batch_y_u), dim=0)
@@ -55,8 +58,8 @@ class GenerativeIterator(object):
             batches_supervised = get_exact_size_batches(
                 len(i_supervised), self.rng, supervised_batch_size)
             for batch_i_s in batches_supervised:
-                batch_X_s = inputs[th.LongTensor(batch_i_s)]
-                batch_y_s = targets[th.LongTensor(batch_i_s)]
+                batch_X_s = inputs[longtype(batch_i_s)]
+                batch_y_s = targets[longtype(batch_i_s)]
                 yield batch_X_s, batch_y_s
 
 
@@ -75,12 +78,11 @@ class GenerativeRevTrainer(object):
         for batch_X, batch_y in self.iterator.get_batches(
                 inputs, targets, inputs_u, linear_weights_u):
             dir_mats = [sample_directions(self.means_per_dim.size()[1], True,
-                                          cuda=False)
+                                          cuda=batch_X.is_cuda)
                         for _ in range(n_dir_matrices)]
             directions = th.cat(dir_mats, dim=0)
             if directions_adv is not None:
                 directions = th.cat((directions, directions_adv), dim=0)
-            #            directions = sample_directions(self.means_per_dim.size()[1], True, cuda=False)
             batch_loss = train_on_batch(batch_X, self.model, self.means_per_dim,
                                         self.stds_per_dim,
                                         batch_y, self.optimizer, directions,
@@ -100,6 +102,7 @@ def train_on_batch(batch_X, model, means_per_dim, stds_per_dim, soft_targets,
         soft_targets = soft_targets.cuda()
 
     batch_outs = model(batch_X)
+    batch_outs = enforce_2d(batch_outs)
     trans_loss = trans_loss_function(batch_outs, directions, soft_targets,
                                      means_per_dim, stds_per_dim)
     optimizer.zero_grad()
@@ -173,7 +176,7 @@ def radial_dist_per_cluster(outs, soft_targets, means_per_dim, stds_per_dim,
                           demean_phases=False, gaussianize_phases=False,
                           n_samples=100, adv_samples=None,
                             n_interpolation_samples='n_outs',
-                            weight_by_expected_diffs=True):
+                            weight_by_expected_diffs=False):
     loss = 0
     for i_cluster in range(len(means_per_dim)):
         this_outs = outs
@@ -204,6 +207,7 @@ def radial_distance_loss(outs, weights, mean, std, n_samples=100,
     if n_interpolation_samples == 'n_outs':
         n_interpolation_samples = len(outs)
     orig_samples = th.autograd.Variable(th.randn(n_samples, len(mean)))
+    orig_samples, std = ensure_on_same_device(orig_samples, std)
     samples = (orig_samples * std.unsqueeze(0)) + mean.unsqueeze(0)
     if adv_samples is not None:
         samples = th.cat((samples, adv_samples), dim=0)
@@ -229,10 +233,10 @@ def radial_distance_loss(outs, weights, mean, std, n_samples=100,
                              for i_sample in range(len(samples))],
                             dim=0)
     empirical_cdf = start + th.cumsum(sorted_probs, dim=1)
-
-    ref_samples = (th.autograd.Variable(
-        th.randn(n_interpolation_samples, len(mean))) * std.unsqueeze(0)) + (
-                      mean.unsqueeze(0))
+    orig_ref_samples = th.autograd.Variable(
+        th.randn(n_interpolation_samples, len(mean)))
+    orig_ref_samples, std = ensure_on_same_device(orig_ref_samples, std)
+    ref_samples = (orig_ref_samples * std.unsqueeze(0)) + (mean.unsqueeze(0))
     reference_diffs = ref_samples.unsqueeze(0) - samples.unsqueeze(1)
     reference_diffs = th.sum((reference_diffs * reference_diffs), dim=2)
     ref_sorted_diffs, _ = th.sort(reference_diffs, dim=1)
@@ -309,9 +313,9 @@ def compute_all_i_cdfs(this_means, this_stds, sorted_weights, directions):
     empirical_cdf = start + th.cumsum(probs, dim=0)
 
     # see https://en.wikipedia.orsorted_softmaxedg/wiki/Normal_distribution -> Quantile function
-    i_cdf = th.autograd.Variable(
-        th.FloatTensor([np.sqrt(2.0)])) * th.erfinv(
-        2 * empirical_cdf - 1)
+    sqrt_2 = th.autograd.Variable(th.FloatTensor([np.sqrt(2.0)]))
+    sqrt_2, empirical_cdf = ensure_on_same_device(sqrt_2, empirical_cdf)
+    i_cdf = sqrt_2 * th.erfinv(2 * empirical_cdf - 1)
     i_cdf = i_cdf.squeeze()
     all_i_cdfs = i_cdf * transformed_stds.t() + transformed_means.t()
     return all_i_cdfs
@@ -447,12 +451,16 @@ class ReversibleBlock(th.nn.Module):
 
 
 class SubsampleSplitter(th.nn.Module):
-    def __init__(self, stride, chunk_chans_first=True):
+    def __init__(self, stride, chunk_chans_first=True, checkerboard=False):
         super(SubsampleSplitter, self).__init__()
         if not hasattr(stride, '__len__'):
             stride = (stride, stride)
         self.stride = stride
         self.chunk_chans_first = chunk_chans_first
+        self.checkerboard = checkerboard
+        if checkerboard:
+            assert stride[0] == 2
+            assert stride[1] == 2
 
     def forward(self, x):
         # Chunk chans first to ensure that each of the two streams in the
@@ -465,13 +473,34 @@ class SubsampleSplitter(th.nn.Module):
         else:
             xs = [x]
         for one_x in xs:
-            for i_stride in range(self.stride[0]):
-                for j_stride in range(self.stride[1]):
-                    new_x.append(
-                        one_x[:, :, i_stride::self.stride[0],
-                        j_stride::self.stride[1]])
+            if not self.checkerboard:
+                for i_stride in range(self.stride[0]):
+                    for j_stride in range(self.stride[1]):
+                        new_x.append(
+                            one_x[:, :, i_stride::self.stride[0],
+                            j_stride::self.stride[1]])
+            else:
+                new_x.append(one_x[:,:,0::2,0::2])
+                new_x.append(one_x[:,:,1::2,1::2])
+                new_x.append(one_x[:,:,0::2,1::2])
+                new_x.append(one_x[:,:,1::2,0::2])
+
         new_x = th.cat(new_x, dim=1)
         return new_x
+
+
+class ViewAs(th.nn.Module):
+    def __init__(self, dims_before, dims_after):
+        super(ViewAs, self).__init__()
+        self.dims_before = dims_before
+        self.dims_after = dims_after
+
+    def forward(self, x):
+        for i_dim in range(len(x.size())):
+            expected = self.dims_before[i_dim]
+            if expected != -1:
+                assert x.size()[i_dim] == expected
+        return x.view(self.dims_after)
 
 
 def invert(feature_model, features):
@@ -516,13 +545,30 @@ def invert(feature_model, features):
 
                 n_chans_before = previous_features.size()[1]
                 cur_chan = 0
-                for i_stride in range(module.stride[0]):
-                    for j_stride in range(module.stride[1]):
-                        previous_features[:, :, i_stride::module.stride[0],
-                        j_stride::module.stride[1]] = (
-                            one_chan_features[:,
-                            cur_chan * n_chans_before:cur_chan * n_chans_before + n_chans_before])
-                        cur_chan += 1
+                if not module.checkerboard:
+                    for i_stride in range(module.stride[0]):
+                        for j_stride in range(module.stride[1]):
+                            previous_features[:, :, i_stride::module.stride[0],
+                                    j_stride::module.stride[1]] = (
+                                one_chan_features[:,
+                                cur_chan * n_chans_before:cur_chan * n_chans_before + n_chans_before])
+                            cur_chan += 1
+                else:
+                    # Manually go through 4 checkerboard positions
+                    assert module.stride[0] == 2
+                    assert module.stride[1] == 2
+                    previous_features[:, :, 0::2,0::2] = (
+                        one_chan_features[:,
+                        0 * n_chans_before:0 * n_chans_before + n_chans_before])
+                    previous_features[:, :, 1::2,1::2] = (
+                        one_chan_features[:,
+                        1 * n_chans_before:1 * n_chans_before + n_chans_before])
+                    previous_features[:, :, 0::2,1::2] = (
+                        one_chan_features[:,
+                        2 * n_chans_before:2 * n_chans_before + n_chans_before])
+                    previous_features[:, :, 1::2,0::2] = (
+                        one_chan_features[:,
+                        3 * n_chans_before:3 * n_chans_before + n_chans_before])
                 all_previous_features.append(previous_features)
             features = th.cat(all_previous_features, dim=1)
         if module.__class__.__name__ == 'AmplitudePhase':
@@ -532,12 +578,31 @@ def invert(feature_model, features):
             phases = features[:, n_chans // 2:]
             x1, x2 = amp_phase_to_x_y(amps, phases)
             features = th.cat((x1, x2), dim=1)
+        if module.__class__.__name__ == 'ViewAs':
+            for i_dim in range(len(features.size())):
+                expected = module.dims_after[i_dim]
+                if expected != -1:
+                    assert features.size()[i_dim] == expected
+            features = features.view(module.dims_before)
     return features
+
+
+def enforce_2d(outs):
+    while len(outs.size()) > 2:
+        n_dims = len(outs.size())
+        outs = outs.squeeze(2)
+        assert len(outs.size()) == n_dims - 1
+    return outs
+
+
+def view_2d(outs):
+    return outs.view(outs.size()[0], -1)
 
 
 def init_std_mean(feature_model, inputs, targets, means_per_dim, stds_per_dim,
                   set_phase_interval):
     outs = feature_model(inputs)
+    outs = enforce_2d(outs)
     for i_cluster in range(len(means_per_dim)):
         n_elems = len(th.nonzero(targets[:, i_cluster] == 1))
         this_weights = targets[:, i_cluster]
@@ -786,7 +851,6 @@ def get_batches_equal_classes(targets, n_classes, rng, batch_size):
 
     batches = np.concatenate(batches_per_cluster, axis=1)
     return batches
-
 
 
 def plot_xyz(x, y, z):
