@@ -121,9 +121,9 @@ def w2_both(outs, directions, soft_targets,
         this_means = means_per_dim[i_cluster:i_cluster + 1]
         this_stds = stds_per_dim[i_cluster:i_cluster + 1]
         this_weights = soft_targets[:, i_cluster]
-        sorted_weights = th.stack([this_weights[i_sorted[:, i_dim]]
-                                   for i_dim in range(i_sorted.size()[1])],
-                                  dim=1)
+        repeated_weights = this_weights.repeat(i_sorted.size()[1], 1).t()
+        sorted_weights = repeated_weights.gather(dim=0, index=i_sorted)
+
         all_i_cdfs = compute_all_i_cdfs(this_means, this_stds, sorted_weights,
                                         directions)
 
@@ -229,9 +229,16 @@ def radial_distance_loss(outs, weights, mean, std, n_samples=100,
     wanted_sum = 1 - (2 / (n_virtual_samples))
     probs = weights * wanted_sum / n_virtual_samples
 
-    sorted_probs = th.stack([probs[i_sorted[i_sample]]
+    sorted_probs = th.stack([probs.index_select(dim=0, index=i_sorted[i_sample])
                              for i_sample in range(len(samples))],
                             dim=0)
+
+    assert False, "please recheck and improve whole code"
+    #print("sorted_probs", sorted_probs.size())
+    #repeated_probs = probs.repeat(i_sorted.size()[1], 1).t()
+    #print("repeated_probs", repeated_probs.size())
+    #sorted_probs = repeated_probs.gather(dim=0, index=i_sorted)
+
     empirical_cdf = start + th.cumsum(sorted_probs, dim=1)
     orig_ref_samples = th.autograd.Variable(
         th.randn(n_interpolation_samples, len(mean)))
@@ -252,7 +259,7 @@ def radial_distance_loss(outs, weights, mean, std, n_samples=100,
     # still samples x outs
     # probs simple without changing for cdf wanted sum...
     probs_simple = weights / th.sum(weights)
-    sorted_probs_simple = th.stack([probs_simple[i_sorted[i_sample]]
+    sorted_probs_simple = th.stack([probs_simple.index_select(dim=0, index=i_sorted[i_sample])
                                     for i_sample in range(len(samples))],
                                    dim=0)
     diff_diff = diff_diff * sorted_probs_simple
