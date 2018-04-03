@@ -77,12 +77,15 @@ class GenerativeRevTrainer(object):
         n_examples = 0
         for batch_X, batch_y in self.iterator.get_batches(
                 inputs, targets, inputs_u, linear_weights_u):
-            dir_mats = [sample_directions(self.means_per_dim.size()[1], True,
-                                          cuda=batch_X.is_cuda)
-                        for _ in range(n_dir_matrices)]
-            directions = th.cat(dir_mats, dim=0)
-            if directions_adv is not None:
-                directions = th.cat((directions, directions_adv), dim=0)
+            if n_dir_matrices > 0:
+                dir_mats = [sample_directions(self.means_per_dim.size()[1], True,
+                                              cuda=batch_X.is_cuda)
+                            for _ in range(n_dir_matrices)]
+                directions = th.cat(dir_mats, dim=0)
+                if directions_adv is not None:
+                    directions = th.cat((directions, directions_adv), dim=0)
+            else:
+                directions = directions_adv
             batch_loss = train_on_batch(batch_X, self.model, self.means_per_dim,
                                         self.stds_per_dim,
                                         batch_y, self.optimizer, directions,
@@ -292,6 +295,74 @@ def interpolate_vals_from_cdf(cdf, ref_sorted_diffs):
         ref_sorted_diffs.unsqueeze(1).unsqueeze(3), grid)
     ref_interpolated_diffs = ref_interpolated_diffs.squeeze(3).squeeze(1)
     return ref_interpolated_diffs
+
+
+## Hard Variants
+
+
+def hard_loss_per_cluster(outs, targets, means_per_dim, stds_per_dim,
+                          hard_loss_fn):
+    loss = 0
+    for i_cluster in range(len(means_per_dim)):
+        mean = means_per_dim[i_cluster]
+        std = stds_per_dim[i_cluster]
+        this_outs = outs[(targets[:, i_cluster] == 1).unsqueeze(1)].view(-1,
+                                                                         outs.size()[
+                                                                             1])
+        this_loss = hard_loss_fn(this_outs, mean, std)
+        loss = this_loss + loss
+    return loss
+
+
+def w2_both_from_samples(samples_a, samples_b, n_dirs, adv_dirs):
+    dirs = [sample_directions(samples_a.size()[1], orthogonalize=True,
+                              cuda=samples_a.is_cuda) for _ in range(n_dirs)]
+    if adv_dirs is not None:
+        dirs = dirs + [adv_dirs]
+    dirs = th.cat(dirs, dim=0)
+    dirs = norm_and_var_directions(dirs)
+    return w2_both_from_samples_for_dirs(samples_a, samples_b, dirs)
+
+
+def w2_both_from_samples_for_dirs(samples_a, samples_b, dirs):
+    projected_samples_a = th.mm(samples_a, dirs.t())
+    sorted_samples_a, _ = th.sort(projected_samples_a, dim=0)
+    projected_samples_b = th.mm(samples_b, dirs.t())
+    sorted_samples_b, _ = th.sort(projected_samples_b, dim=0)
+    diffs = sorted_samples_a - sorted_samples_b
+    # first sum across examples
+    # (one W2-value per direction)
+    # then mean across directions
+    # then sqrt
+    loss = th.sqrt(th.mean(diffs * diffs))
+    return loss
+
+
+def w2_both_from_samples_for_gauss_dist(outs, mean, std, n_dirs, adv_dirs):
+    gauss_samples = get_gauss_samples(len(outs), mean, std)
+    return w2_both_from_samples(outs, gauss_samples, n_dirs, adv_dirs)
+
+
+def radial_distance_loss_from_samples_for_test_samples(samples_a, samples_b, test_samples,):
+    diffs_a = samples_a.unsqueeze(0) - test_samples.unsqueeze(1)
+    diffs_a = th.sqrt(th.sum((diffs_a * diffs_a), dim=2))
+    sorted_diffs_a, _ = th.sort(diffs_a, dim=1)
+
+    diffs_b = samples_b.unsqueeze(0) - test_samples.unsqueeze(1)
+    diffs_b = th.sqrt(th.sum((diffs_b * diffs_b), dim=2))
+    sorted_diffs_b, _ = th.sort(diffs_b, dim=1)
+
+    diff_diff = (sorted_diffs_a - sorted_diffs_b)
+    loss = th.sqrt(th.mean(diff_diff * diff_diff))
+    return loss
+
+
+def radial_distance_loss_from_samples_for_gauss_dist(outs, mean, std, n_test_samples, adv_samples):
+    test_samples = get_gauss_samples(n_test_samples, mean, std)
+    if adv_samples is not None:
+        test_samples = th.cat((test_samples, adv_samples), dim=0)
+    gauss_samples = get_gauss_samples(len(outs), mean, std)
+    return radial_distance_loss_from_samples_for_test_samples(outs, gauss_samples, test_samples)
 
 
 def uniform_to_gaussian_phases_in_outs(outs_with_demeaned_phases, means):
