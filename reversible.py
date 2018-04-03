@@ -113,6 +113,7 @@ def train_on_batch(batch_X, model, means_per_dim, stds_per_dim, soft_targets,
 
 def w2_both(outs, directions, soft_targets,
             means_per_dim, stds_per_dim):
+    assert len(soft_targets) == len(outs)
     directions = norm_and_var_directions(directions)
     projected_samples = th.mm(outs, directions.t())
     sorted_samples, i_sorted = th.sort(projected_samples, dim=0)
@@ -123,19 +124,27 @@ def w2_both(outs, directions, soft_targets,
         this_weights = soft_targets[:, i_cluster]
         repeated_weights = this_weights.repeat(i_sorted.size()[1], 1).t()
         sorted_weights = repeated_weights.gather(dim=0, index=i_sorted)
-
         all_i_cdfs = compute_all_i_cdfs(this_means, this_stds, sorted_weights,
                                         directions)
 
         diffs = all_i_cdfs - sorted_samples
-        # why times weights and not times probs?
-        this_loss = th.sqrt(th.mean(diffs * diffs * sorted_weights))
+        # for numerical stabilty don't compute probs and sum
+        # but rather compute normed weights and mean
+        # -> is identical
+        normed_weights = sorted_weights / th.mean(this_weights)
+        # first sum across examples (weighted by probs)
+        # (one W2-value per direction)
+        # then mean across directions
+        # then sqrt
+        this_loss = th.sqrt(th.mean(diffs * diffs * normed_weights))
+
         loss = loss + this_loss
     return loss
 
 
 def w2_both_demeaned_phases(outs, directions, soft_targets,
             means_per_dim, stds_per_dim, gaussianize_phases):
+    assert len(soft_targets) == len(outs)
     loss = 0
     directions = norm_and_var_directions(directions)
     for i_cluster in range(len(means_per_dim)):
@@ -149,17 +158,23 @@ def w2_both_demeaned_phases(outs, directions, soft_targets,
                 this_outs,  means=this_means.squeeze(0))
         projected_samples = th.mm(this_outs, directions.t())
         sorted_samples, i_sorted = th.sort(projected_samples, dim=0)
-        sorted_weights = th.stack([this_weights[i_sorted[:, i_dim]]
-                                   for i_dim in range(i_sorted.size()[1])],
-                                  dim=1)
+        repeated_weights = this_weights.repeat(i_sorted.size()[1], 1).t()
+        sorted_weights = repeated_weights.gather(dim=0, index=i_sorted)
         all_i_cdfs = compute_all_i_cdfs(this_means, this_stds, sorted_weights,
                                         directions)
 
         diffs = all_i_cdfs - sorted_samples
-        this_loss = th.sqrt(th.mean(diffs * diffs * sorted_weights))
+        # for numerical stabilty don't compute probs and sum
+        # but rather compute normed weights and mean
+        # -> is identical
+        normed_weights = sorted_weights / th.mean(this_weights)
+        # first sum across examples (weighted by probs)
+        # (one W2-value per direction)
+        # then mean across directions
+        # then sqrt
+        this_loss = th.sqrt(th.mean(diffs * diffs * normed_weights))
         loss = loss + this_loss
     return loss
-
 
 
 def standard_gaussian_icdf(cdfs):
@@ -173,10 +188,9 @@ def standard_gaussian_cdf(vals):
 
 
 def radial_dist_per_cluster(outs, soft_targets, means_per_dim, stds_per_dim,
-                          demean_phases=False, gaussianize_phases=False,
-                          n_samples=100, adv_samples=None,
-                            n_interpolation_samples='n_outs',
-                            weight_by_expected_diffs=False):
+                            demean_phases=False, gaussianize_phases=False,
+                            n_samples=100, adv_samples=None,
+                            n_interpolation_samples='n_outs'):
     loss = 0
     for i_cluster in range(len(means_per_dim)):
         this_outs = outs
@@ -193,8 +207,8 @@ def radial_dist_per_cluster(outs, soft_targets, means_per_dim, stds_per_dim,
             assert not gaussianize_phases
         this_loss = radial_distance_loss(
             this_outs, this_weights, this_means, this_stds, n_samples=n_samples,
-            adv_samples=adv_samples, n_interpolation_samples=n_interpolation_samples,
-            weight_by_expected_diffs=weight_by_expected_diffs)
+            adv_samples=adv_samples,
+            n_interpolation_samples=n_interpolation_samples)
 
         loss = loss + this_loss
     return loss
@@ -202,70 +216,82 @@ def radial_dist_per_cluster(outs, soft_targets, means_per_dim, stds_per_dim,
 
 def radial_distance_loss(outs, weights, mean, std, n_samples=100,
                          adv_samples=None,
-                         n_interpolation_samples='n_outs',
-                         weight_by_expected_diffs=True):
+                         n_interpolation_samples='n_outs'):
     if n_interpolation_samples == 'n_outs':
         n_interpolation_samples = len(outs)
-    orig_samples = th.autograd.Variable(th.randn(n_samples, len(mean)))
-    orig_samples, std = ensure_on_same_device(orig_samples, std)
-    samples = (orig_samples * std.unsqueeze(0)) + mean.unsqueeze(0)
+    # some samples as testpoints from where to check distances
+    samples = get_gauss_samples(n_samples, mean, std)
     if adv_samples is not None:
         samples = th.cat((samples, adv_samples), dim=0)
-    # compute expected w2 distance per sample
-    # to weight the loss
-    demeaned_samples = samples - mean.unsqueeze(0)
-    noncentrality_per_sample = th.sum((demeaned_samples *demeaned_samples), dim=1)
-    expected_diffs = th.sqrt(noncentrality_per_sample + th.sum(std * std).unsqueeze(0))
-    expected_diffs = expected_diffs / th.sum(expected_diffs)
-    if not weight_by_expected_diffs:
-        expected_diffs = expected_diffs * 0 + 1
     diffs = outs.unsqueeze(0) - samples.unsqueeze(1)
-    diffs = th.sum((diffs * diffs), dim=2)
-
-
+    diffs = th.sqrt(th.sum((diffs * diffs), dim=2))
     sorted_diffs, i_sorted = th.sort(diffs, dim=1)
+
+    ref_samples = get_gauss_samples(n_interpolation_samples, mean, std)
+    reference_diffs = ref_samples.unsqueeze(0) - samples.unsqueeze(1)
+    reference_diffs = th.sqrt(
+        th.sum((reference_diffs * reference_diffs), dim=2))
+    ref_sorted_diffs, _ = th.sort(reference_diffs, dim=1)
+
+    # get cdf from sorted probs by distances to (landmark) samples
+    empirical_cdf = weights_to_cdf(weights, i_sorted)
+    ref_interpolated_diffs = interpolate_vals_from_cdf(empirical_cdf,
+                                                       ref_sorted_diffs)
+
+    diff_diff = (ref_interpolated_diffs - sorted_diffs)
+    # still samples x outs
+    # probs simple without changing for cdf wanted sum...
+    # for numerical stabilty don't compute probs and sum
+    # but rather compute normed weights and mean
+    # -> is identical
+    # probs_simple = weights / th.sum(weights)
+    # repeated_probs_simple = probs_simple.repeat(i_sorted.size()[0], 1)
+    # sorted_probs_simple = repeated_probs_simple.gather(dim=1, index=i_sorted)
+    normed_weights = weights / th.mean(weights)
+    repeated_normed_weights = normed_weights.repeat(i_sorted.size()[0], 1)
+    sorted_normed_weights = repeated_normed_weights.gather(dim=1,
+                                                           index=i_sorted)
+
+    # first sum across examples (weighted by probs)
+    # (one W2-value per (landmark) sample)
+    # then mean across (landmark) samples
+    # then sqrt
+    loss = th.sqrt(th.mean(diff_diff * diff_diff * sorted_normed_weights))
+    return loss
+
+
+def get_gauss_samples(n_samples, mean, std):
+    if mean.is_cuda:
+        orig_samples = th.cuda.FloatTensor(n_samples, len(mean)).normal_(0, 1)
+    else:
+        orig_samples = th.FloatTensor(n_samples, len(mean)).normal_(0, 1)
+    orig_samples = th.autograd.Variable(orig_samples)
+    samples = (orig_samples * std.unsqueeze(0)) + mean.unsqueeze(0)
+    return samples
+
+
+def weights_to_cdf(weights, i_sorted):
     n_virtual_samples = th.sum(weights)
     start = 1 / (2 * n_virtual_samples)
     wanted_sum = 1 - (2 / (n_virtual_samples))
     probs = weights * wanted_sum / n_virtual_samples
-
-    sorted_probs = th.stack([probs.index_select(dim=0, index=i_sorted[i_sample])
-                             for i_sample in range(len(samples))],
-                            dim=0)
-
-    assert False, "please recheck and improve whole code"
-    #print("sorted_probs", sorted_probs.size())
-    #repeated_probs = probs.repeat(i_sorted.size()[1], 1).t()
-    #print("repeated_probs", repeated_probs.size())
-    #sorted_probs = repeated_probs.gather(dim=0, index=i_sorted)
-
+    repeated_probs = probs.repeat(i_sorted.size()[0], 1)
+    sorted_probs = repeated_probs.gather(dim=1, index=i_sorted)
     empirical_cdf = start + th.cumsum(sorted_probs, dim=1)
-    orig_ref_samples = th.autograd.Variable(
-        th.randn(n_interpolation_samples, len(mean)))
-    orig_ref_samples, std = ensure_on_same_device(orig_ref_samples, std)
-    ref_samples = (orig_ref_samples * std.unsqueeze(0)) + (mean.unsqueeze(0))
-    reference_diffs = ref_samples.unsqueeze(0) - samples.unsqueeze(1)
-    reference_diffs = th.sum((reference_diffs * reference_diffs), dim=2)
-    ref_sorted_diffs, _ = th.sort(reference_diffs, dim=1)
-    grid_x = (empirical_cdf - 0.5) * 2
+    return empirical_cdf
+
+
+def interpolate_vals_from_cdf(cdf, ref_sorted_diffs):
+    # cdf is 2d
+    # ref sorted diffs also 2d
+    grid_x = (cdf - 0.5) * 2
     # samples x reference samples
     grid_y = grid_x.detach() * 0
     grid = th.stack((grid_y, grid_x), dim=2).unsqueeze(2)
-    # samples x reference samples x 1 x 2
     ref_interpolated_diffs = th.nn.functional.grid_sample(
         ref_sorted_diffs.unsqueeze(1).unsqueeze(3), grid)
     ref_interpolated_diffs = ref_interpolated_diffs.squeeze(3).squeeze(1)
-    diff_diff = th.abs(ref_interpolated_diffs - sorted_diffs)
-    # still samples x outs
-    # probs simple without changing for cdf wanted sum...
-    probs_simple = weights / th.sum(weights)
-    sorted_probs_simple = th.stack([probs_simple.index_select(dim=0, index=i_sorted[i_sample])
-                                    for i_sample in range(len(samples))],
-                                   dim=0)
-    diff_diff = diff_diff * sorted_probs_simple
-    # sum over weighted outs, then norm by expected diff
-    loss = th.mean(th.sqrt(th.sum(diff_diff, dim=1)) / expected_diffs)
-    return loss
+    return ref_interpolated_diffs
 
 
 def uniform_to_gaussian_phases_in_outs(outs_with_demeaned_phases, means):
@@ -778,12 +804,14 @@ def sizes_from_weights(size, weights, ):
 
 
 def sample_directions(n_dims, orthogonalize, cuda):
-    directions = th.randn(n_dims, n_dims)
+    if cuda:
+        directions = th.cuda.FloatTensor(n_dims, n_dims).normal_(0, 1)
+    else:
+        directions = th.FloatTensor(n_dims, n_dims).normal_(0, 1)
+
     if orthogonalize:
         directions, _ = th.qr(directions)
 
-    if cuda:
-        directions = directions.cuda()
     directions = th.autograd.Variable(directions, requires_grad=False)
     norm_factors = th.norm(directions, p=2, dim=1, keepdim=True)
     directions = directions / norm_factors
