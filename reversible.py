@@ -299,6 +299,82 @@ def interpolate_vals_from_cdf(cdf, ref_sorted_diffs):
 
 ## Hard Variants
 
+def sinkhorn_to_gauss_dist(outs, mean, std, **kwargs):
+    gauss_samples = get_gauss_samples(len(outs), mean, std)
+    return sinkhorn_sample_loss(outs, gauss_samples, **kwargs)
+
+
+def log_sum_exp(A):
+    "log-sum-exp"
+    return th.log(
+        th.exp(A).sum(1, keepdim=True) + 1e-6)  # add 10^-6 to prevent NaN
+
+def log_sum_exp_2(value, dim=None, keepdim=False):
+    # https://github.com/pytorch/pytorch/issues/2591#issuecomment-338980717
+    """Numerically stable implementation of the operation
+
+    value.exp().sum(dim, keepdim).log()
+    """
+    # TODO: torch.max(value, dim=None) threw an error at time of writing
+    if dim is not None:
+        m, _ = th.max(value, dim=dim, keepdim=True)
+        value0 = value - m
+        if keepdim is False:
+            m = m.squeeze(dim)
+        return m + th.log(th.sum(th.exp(value0),
+                                       dim=dim, keepdim=keepdim))
+    else:
+        m = th.max(value)
+        sum_exp = th.sum(th.exp(value - m))
+        return m + th.log(sum_exp)
+
+def M(u, v, C, epsilon):
+    "Modified cost for logarithmic updates"
+    "$M_{ij} = (-c_{ij} + u_i + v_j) / \epsilon$"
+    return (-C + u.unsqueeze(1) + v.unsqueeze(0)) / epsilon
+
+
+def sinkhorn_sample_loss(samples_a, samples_b, epsilon=0.01, stop_threshold=0.1,
+                         max_iters=50):
+    diffs = samples_a.unsqueeze(1) - samples_b.unsqueeze(0)
+    C = th.sum(diffs * diffs, dim=2)
+    del diffs
+    C_nograd = C.detach()
+
+    estimated_trans_th = estimate_transport_matrix_sinkhorn(C_nograd,
+                                                            epsilon=epsilon,
+                                                            stop_threshold=stop_threshold,
+                                                            max_iters=max_iters)
+    cost = th.sqrt(th.sum(estimated_trans_th * C))  # Sinkhorn cost
+    return cost
+
+
+def estimate_transport_matrix_sinkhorn(C, epsilon=0.01, stop_threshold=0.1,
+                                       max_iters=50):
+    n1 = C.size()[0]
+    n2 = C.size()[1]
+    mu = th.autograd.Variable(1. / n1 * th.FloatTensor(n1).fill_(1),
+                              requires_grad=False)
+    nu = th.autograd.Variable(1. / n2 * th.FloatTensor(n2).fill_(1),
+                              requires_grad=False)
+    mu, nu, C = ensure_on_same_device(mu, nu, C)
+    C = C / th.mean(C)  # stabilize computation
+    u, v, err = 0. * mu, 0. * nu, 0.
+    actual_nits = 0  # to check if algorithm terminates because of threshold or max iterations reached
+    for i in range(max_iters):
+        u1 = u  # useful to check the update
+        u = epsilon * (
+            th.log(mu) - log_sum_exp_2(M(u, v, C, epsilon), dim=1, keepdim=True).squeeze()) + u
+        v = epsilon * (
+            th.log(nu) - log_sum_exp_2(M(u, v, C, epsilon).t(), dim=1, keepdim=True).squeeze()) + v
+        err = (u - u1).abs().sum()
+
+        actual_nits += 1
+        if var_to_np(err < stop_threshold):
+            break
+    estimated_transport_matrix = th.exp(M(u, v, C, epsilon))
+    return estimated_transport_matrix
+
 
 def hard_loss_per_cluster(outs, targets, means_per_dim, stds_per_dim,
                           hard_loss_fn):
@@ -358,9 +434,15 @@ def radial_distance_loss_from_samples_for_test_samples(samples_a, samples_b, tes
 
 
 def radial_distance_loss_from_samples_for_gauss_dist(outs, mean, std, n_test_samples, adv_samples):
-    test_samples = get_gauss_samples(n_test_samples, mean, std)
+    if (n_test_samples is not None) and n_test_samples > 0:
+        test_samples = get_gauss_samples(n_test_samples, mean, std)
+    else:
+        test_samples = None
     if adv_samples is not None:
-        test_samples = th.cat((test_samples, adv_samples), dim=0)
+        if test_samples is not None:
+            test_samples = th.cat((test_samples, adv_samples), dim=0)
+        else:
+            test_samples = adv_samples
     gauss_samples = get_gauss_samples(len(outs), mean, std)
     return radial_distance_loss_from_samples_for_test_samples(outs, gauss_samples, test_samples)
 
