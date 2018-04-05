@@ -335,11 +335,17 @@ def M(u, v, C, epsilon):
 
 
 def sinkhorn_sample_loss(samples_a, samples_b, epsilon=0.01, stop_threshold=0.1,
-                         max_iters=50):
+                         max_iters=50, normalize_cost_matrix=False):
+    assert normalize_cost_matrix in [False, 'mean', 'max']
     diffs = samples_a.unsqueeze(1) - samples_b.unsqueeze(0)
     C = th.sum(diffs * diffs, dim=2)
     del diffs
     C_nograd = C.detach()
+    if normalize_cost_matrix == 'mean':
+        C_nograd = C_nograd / th.mean(C_nograd)
+    elif normalize_cost_matrix == 'max':
+        C_nograd = C_nograd / th.max(C_nograd)
+
 
     estimated_trans_th = estimate_transport_matrix_sinkhorn(C_nograd,
                                                             epsilon=epsilon,
@@ -358,7 +364,6 @@ def estimate_transport_matrix_sinkhorn(C, epsilon=0.01, stop_threshold=0.1,
     nu = th.autograd.Variable(1. / n2 * th.FloatTensor(n2).fill_(1),
                               requires_grad=False)
     mu, nu, C = ensure_on_same_device(mu, nu, C)
-    C = C / th.mean(C)  # stabilize computation
     u, v, err = 0. * mu, 0. * nu, 0.
     actual_nits = 0  # to check if algorithm terminates because of threshold or max iterations reached
     for i in range(max_iters):
