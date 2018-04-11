@@ -299,6 +299,26 @@ def interpolate_vals_from_cdf(cdf, ref_sorted_diffs):
 
 ## Hard Variants
 
+def semi_dual_transport_loss(outs, mean, std):
+    gauss_samples = get_gauss_samples(len(outs), mean, std)
+    return semi_dual_transport_loss_for_samples(outs, gauss_samples, v_network, u_network)
+
+
+def semi_dual_transport_loss_for_samples(samples_a, samples_b, a_network, b_network):
+    diffs = samples_a.unsqueeze(1) - samples_b.unsqueeze(0)
+    diffs = th.sum((diffs * diffs), dim=2)
+    samples_a = samples_a.detach()
+    samples_b = samples_b.detach()
+    cur_v = a_network(samples_a).squeeze(1)
+    cur_u = b_network(samples_b).squeeze(1)
+    diffs_v = diffs - cur_v.unsqueeze(1)
+    diffs_u = diffs - cur_u.unsqueeze(0)
+    min_diffs_v, _ = th.min(diffs_v, dim=0)
+    min_diffs_u, _ = th.min(diffs_u, dim=1)
+    ot_dist = th.mean(cur_v) + th.mean(cur_u)  + th.mean(min_diffs_u) + th.mean(min_diffs_v)
+    return ot_dist
+
+
 def sinkhorn_to_gauss_dist(outs, mean, std, **kwargs):
     gauss_samples = get_gauss_samples(len(outs), mean, std)
     return sinkhorn_sample_loss(outs, gauss_samples, **kwargs)
@@ -335,7 +355,7 @@ def M(u, v, C, epsilon):
 
 
 def sinkhorn_sample_loss(samples_a, samples_b, epsilon=0.01, stop_threshold=0.1,
-                         max_iters=50, normalize_cost_matrix=False):
+                         max_iters=50, normalize_cost_matrix=False, max_normed_entropy=None):
     assert normalize_cost_matrix in [False, 'mean', 'max']
     diffs = samples_a.unsqueeze(1) - samples_b.unsqueeze(0)
     C = th.sum(diffs * diffs, dim=2)
@@ -346,14 +366,37 @@ def sinkhorn_sample_loss(samples_a, samples_b, epsilon=0.01, stop_threshold=0.1,
     elif normalize_cost_matrix == 'max':
         C_nograd = C_nograd / th.max(C_nograd)
 
+    if max_normed_entropy is None:
+        estimated_trans_th = estimate_transport_matrix_sinkhorn(
+            C_nograd, epsilon=epsilon, stop_threshold=stop_threshold,
+            max_iters=max_iters)
+    else:
+        estimated_trans_th, _ = transport_mat_sinkhorn_below_entropy(
+            C_nograd, start_eps=epsilon, stop_threshold=stop_threshold,
+            max_iters_sinkhorn=max_iters, max_iters_for_entropy=10,
+            max_normed_entropy=max_normed_entropy)
 
-    estimated_trans_th = estimate_transport_matrix_sinkhorn(C_nograd,
-                                                            epsilon=epsilon,
-                                                            stop_threshold=stop_threshold,
-                                                            max_iters=max_iters)
     cost = th.sqrt(th.sum(estimated_trans_th * C))  # Sinkhorn cost
     return cost
 
+
+def transport_mat_sinkhorn_below_entropy(
+        C, start_eps, max_normed_entropy, max_iters_for_entropy,
+        max_iters_sinkhorn=50, stop_threshold=1e-3):
+    normed_entropy = max_normed_entropy + 1
+    iteration = 0
+    cur_eps = start_eps
+    while (normed_entropy > max_normed_entropy) and (iteration < max_iters_for_entropy):
+
+        transport_mat = estimate_transport_matrix_sinkhorn(
+            C, epsilon=cur_eps, stop_threshold=stop_threshold, max_iters=max_iters_sinkhorn)
+        relevant_mat = transport_mat[transport_mat > 0]
+        normed_entropy = -th.sum(relevant_mat * th.log(relevant_mat)) / np.log(transport_mat.numel() * 1.)
+        normed_entropy = var_to_np(normed_entropy)
+        iteration += 1
+        cur_eps = cur_eps / 2
+
+    return transport_mat, cur_eps
 
 def estimate_transport_matrix_sinkhorn(C, epsilon=0.01, stop_threshold=0.1,
                                        max_iters=50):
@@ -795,14 +838,14 @@ def init_std_mean(feature_model, inputs, targets, means_per_dim, stds_per_dim,
     outs = feature_model(inputs)
     outs = enforce_2d(outs)
     for i_cluster in range(len(means_per_dim)):
-        n_elems = len(th.nonzero(targets[:, i_cluster] == 1))
         this_weights = targets[:, i_cluster]
+        n_elems = len(th.nonzero(this_weights == 1))
+        this_outs = outs
         if set_phase_interval:
             this_outs = set_phase_interval_around_mean_in_outs(
-                outs, this_weights=this_weights)
-
+                this_outs, this_weights=this_weights)
         this_outs = this_outs[(this_weights == 1).unsqueeze(1)].resize(
-            n_elems, outs.size()[1])
+            n_elems, this_outs.size()[1])
 
         means = th.mean(this_outs, dim=0)
         # this_outs = uniform_to_gaussian_phases_in_outs(this_outs,means)
