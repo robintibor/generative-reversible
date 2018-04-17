@@ -77,3 +77,8 @@ def init_std_mean(feature_model, inputs, targets, means_per_dim, stds_per_dim,
         stds = th.std(this_outs, dim=0)
         means_per_dim.data[i_cluster] = means.data
         stds_per_dim.data[i_cluster] = stds.data
+
+
+def select_outs_from_targets(outs, targets, i_cluster):
+    return outs[(targets[:, i_cluster] == 1).unsqueeze(1)].view(
+            -1, outs.size()[1])

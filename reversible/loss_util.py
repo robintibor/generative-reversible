@@ -11,3 +11,5 @@ def hard_loss_per_cluster(outs, targets, means_per_dim, stds_per_dim,
         this_loss = hard_loss_fn(this_outs, mean, std)
         loss = this_loss + loss
     return loss / float(len(means_per_dim))
+
+

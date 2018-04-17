@@ -91,6 +91,15 @@ def invert(feature_model, features):
             x1 = y2 - module.G(y1)
             x2 = y1 - module.F(x1)
             features = th.cat((x1, x2), dim=1)
+        if module.__class__.__name__ == 'ReversibleBlockMemCNN':
+            n_chans = features.size()[1]
+            y1 = features[:, :n_chans // 2]
+            y2 = features[:, n_chans // 2:]
+            #y1 = F(x2) + x1
+            #y2 = G(y1) + x2
+            x2 = y2 - module.Gm(y1)
+            x1 = y1 - module.Fm(x2)
+            features = th.cat((x1, x2), dim=1)
         if module.__class__.__name__ == 'SubsampleSplitter':
             # after splitting the input into two along channel dimension if possible
             # for i_stride in range(self.stride):
@@ -158,6 +167,10 @@ def invert(feature_model, features):
                 if expected != -1:
                     assert features.size()[i_dim] == expected
             features = features.view(module.dims_before)
+        if module.__class__.__name__ == 'ConstantPad2d':
+            assert len(module.padding) == 4
+            left, right, top, bottom = module.padding  # see pytorch docs
+            features = features[:, :, top:-bottom, left:-right]  # see pytorch docs
     return features
 
 

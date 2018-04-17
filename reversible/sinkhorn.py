@@ -16,9 +16,14 @@ def M(u, v, C, epsilon):
 
 
 def sinkhorn_sample_loss(samples_a, samples_b, epsilon=0.01, stop_threshold=0.1,
-                         max_iters=50, normalize_cost_matrix=False, max_normed_entropy=None):
+                         max_iters=50, normalize_cost_matrix=False, max_normed_entropy=None,
+                         normalize_by_empirical_std_a=False):
     assert normalize_cost_matrix in [False, 'mean', 'max']
     diffs = samples_a.unsqueeze(1) - samples_b.unsqueeze(0)
+    if normalize_by_empirical_std_a:
+        stds = th.std(samples_a.detach(), dim=0, keepdim=True)
+        stds = th.clamp(stds, min=1e-5)
+        diffs = diffs / stds
     C = th.sum(diffs * diffs, dim=2)
     del diffs
     C_nograd = C.detach()
