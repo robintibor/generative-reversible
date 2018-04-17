@@ -11,9 +11,9 @@ def sample_directions(n_dims, orthogonalize, cuda):
 
     if orthogonalize:
         directions, r = th.qr(directions)
-        #d = th.diag(r, 0)
-        #ph = d.sign()
-        #directions *= ph
+        d = th.diag(r, 0)
+        ph = d.sign()
+        directions *= ph
     directions = th.autograd.Variable(directions, requires_grad=False)
     norm_factors = th.norm(directions, p=2, dim=1, keepdim=True)
     directions = directions / norm_factors

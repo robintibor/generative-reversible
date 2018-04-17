@@ -79,7 +79,9 @@ class ReversibleBlockFunction(torch.autograd.Function):
         ctx.Gm = Gm
 
         # partition in two equally sized set of channels
-        x1, x2 = torch.chunk(x, 2, dim=1)
+        #x1, x2 = torch.chunk(x, 2, dim=1)
+        # HACK robintibor@gmail.com make same as mine
+        x2, x1 = torch.chunk(x, 2, dim=1)
         x1, x2 = x1.contiguous(), x2.contiguous()
 
         # compute outputs
@@ -147,14 +149,18 @@ class ReversibleBlockFunction(torch.autograd.Function):
         x2_grad = dd[1]
         x1_grad = dd[0]
 
-        grad_input = torch.cat([x1_grad, x2_grad], dim=1)
+        #HACK change order
+        #grad_input = torch.cat([x1_grad, x2_grad], dim=1)
+        grad_input = torch.cat([x2_grad, x1_grad], dim=1)
 
         y1_.detach_()
         y2_.detach_()
         del y1_, y2_
 
         # restore input
-        x.data.set_(torch.cat([x1.data, x2.data], dim=1).contiguous())
+        #HACK change order
+        #x.data.set_(torch.cat([x1.data, x2.data], dim=1).contiguous())
+        x.data.set_(torch.cat([x2.data, x1.data], dim=1).contiguous())
         return (grad_input, None, None) + FWgrads + GWgrads
 
 
@@ -193,7 +199,9 @@ class ReversibleBlockFunction2(torch.autograd.Function):
         ctx.Gm = Gm
 
         # partition in two equally sized set of channels
-        x1, x2 = torch.chunk(x, 2, dim=1)
+        #x1, x2 = torch.chunk(x, 2, dim=1)
+        # Hack change order
+        x2, x1 = torch.chunk(x, 2, dim=1)
         x1, x2 = x1.contiguous(), x2.contiguous()
 
         # compute outputs
@@ -265,14 +273,18 @@ class ReversibleBlockFunction2(torch.autograd.Function):
         FWgrads = dd[2:]
         x2_grad = dd[1] + y2_grad
         x1_grad = dd[0]
-        grad_input = torch.cat([x1_grad, x2_grad], dim=1)
+        # hack change order
+        #grad_input = torch.cat([x1_grad, x2_grad], dim=1)
+        grad_input = torch.cat([x2_grad, x1_grad], dim=1)
 
         y1_.detach_()
         y2_.detach_()
         del y1_, y2_
 
         # restore input
-        x.data.set_(torch.cat([x1.data, x2.data], dim=1).contiguous())
+        #x.data.set_(torch.cat([x1.data, x2.data], dim=1).contiguous())
+        # hack change order
+        x.data.set_(torch.cat([x2.data, x1.data], dim=1).contiguous())
         return (grad_input, None, None) + FWgrads + GWgrads
 
 
@@ -364,12 +376,17 @@ def invert(feature_model, features):
             features = th.cat((x1, x2), dim=1)
         if module.__class__.__name__ == 'ReversibleBlock':
             n_chans = features.size()[1]
+            # y1 = self.F(x1) + x2
+            # y2 = self.G(y1) + x1
             y1 = features[:, :n_chans // 2]
             y2 = features[:, n_chans // 2:]
+            x1 = y2 - module.Gm(y1)
+            x2 = y1 - module.Fm(x1)
+            # OLD, No longer correct:
             #y1 = F(x2) + x1
             #y2 = G(y1) + x2
-            x2 = y2 - module.Gm(y1)
-            x1 = y1 - module.Fm(x2)
+            #x2 = y2 - module.Gm(y1)
+            #x1 = y1 - module.Fm(x2)
             features = th.cat((x1, x2), dim=1)
         if module.__class__.__name__ == 'SubsampleSplitter':
             # after splitting the input into two along channel dimension if possible
