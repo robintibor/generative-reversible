@@ -10,8 +10,10 @@ def sample_directions(n_dims, orthogonalize, cuda):
         directions = th.FloatTensor(n_dims, n_dims).normal_(0, 1)
 
     if orthogonalize:
-        directions, _ = th.qr(directions)
-
+        directions, r = th.qr(directions)
+        #d = th.diag(r, 0)
+        #ph = d.sign()
+        #directions *= ph
     directions = th.autograd.Variable(directions, requires_grad=False)
     norm_factors = th.norm(directions, p=2, dim=1, keepdim=True)
     directions = directions / norm_factors
@@ -26,9 +28,10 @@ def norm_and_var_directions(directions):
     return directions
 
 
-def sliced_from_samples(samples_a, samples_b, n_dirs, adv_dirs):
+def sliced_from_samples(samples_a, samples_b, n_dirs, adv_dirs,
+                        orthogonalize=True):
     assert (n_dirs > 0) or (adv_dirs is not None)
-    dirs = [sample_directions(samples_a.size()[1], orthogonalize=True,
+    dirs = [sample_directions(samples_a.size()[1], orthogonalize=orthogonalize,
                               cuda=samples_a.is_cuda) for _ in range(n_dirs)]
     if adv_dirs is not None:
         dirs = dirs + [adv_dirs]
@@ -51,7 +54,7 @@ def sliced_from_samples_for_dirs(samples_a, samples_b, dirs):
     return loss
 
 
-def sliced_from_samples_for_gauss_dist(outs, mean, std, n_dirs, adv_dirs):
+def sliced_from_samples_for_gauss_dist(outs, mean, std, n_dirs, adv_dirs, **kwargs):
     gauss_samples = get_gauss_samples(len(outs), mean, std)
-    return sliced_from_samples(outs, gauss_samples, n_dirs, adv_dirs)
+    return sliced_from_samples(outs, gauss_samples, n_dirs, adv_dirs, **kwargs)
 

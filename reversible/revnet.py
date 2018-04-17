@@ -346,7 +346,10 @@ class ViewAs(th.nn.Module):
 
 
 def invert(feature_model, features):
-    if feature_model.__class__.__name__ == 'ReversibleBlock' or feature_model.__class__.__name__ == 'SubsampleSplitter':
+    if (feature_model.__class__.__name__ == 'ReversibleBlock') or \
+            (feature_model.__class__.__name__ == 'SubsampleSplitter') or (
+                feature_model.__class__.__name__ == 'ReversibleBlockOld'
+    ):
         feature_model = th.nn.Sequential(feature_model, )
     for module in reversed(list(feature_model.children())):
         if module.__class__.__name__ == 'ReversibleBlockOld':
