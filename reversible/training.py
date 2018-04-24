@@ -1,10 +1,10 @@
 from numpy.random import RandomState
 import torch as th
 import numpy as np
-
 from reversible.ampphase import set_phase_interval_around_mean_in_outs
-from reversible.util import var_to_np, enforce_2d
+from reversible.util import var_to_np, enforce_2d, np_to_var
 from reversible.sliced import sample_directions
+from reversible.util import ensure_on_same_device
 
 
 class GenerativeRevTrainer(object):
@@ -82,3 +82,33 @@ def init_std_mean(feature_model, inputs, targets, means_per_dim, stds_per_dim,
 def select_outs_from_targets(outs, targets, i_cluster):
     return outs[(targets[:, i_cluster] == 1).unsqueeze(1)].view(
             -1, outs.size()[1])
+
+
+def hard_init_std_mean(feature_model, inputs, targets, means_per_cluster,
+                       stds_per_cluster, ):
+    for i_cluster in range(len(means_per_cluster)):
+        target_mask = targets[:, i_cluster] == 1
+        for _ in range(1, len(inputs.size())):
+            target_mask = target_mask.unsqueeze(1)
+        this_ins = inputs[target_mask]
+        new_shape = (-1,) + inputs.shape[1:]
+        this_ins = this_ins.view(*new_shape)
+        this_outs = feature_model(this_ins)
+        mean = means_per_cluster[i_cluster]
+        std = stds_per_cluster[i_cluster]
+        emp_mean = th.mean(this_outs, dim=0)
+        emp_std = th.std(this_outs, dim=0)
+        mean.data = emp_mean.data
+        std.data = emp_std.data
+
+def get_batch(inputs, targets, rng, batch_size, with_replacement, i_class='all', ):
+    if i_class == 'all':
+        indices = list(range(len(inputs)))
+    else:
+        indices = np.flatnonzero(var_to_np(targets[:,i_class]) == 1)
+    batch_inds = rng.choice(indices, size=batch_size, replace=with_replacement)
+    th_inds = np_to_var(batch_inds, dtype=np.int64)
+    th_inds, _ = ensure_on_same_device(th_inds, inputs)
+    batch_X = inputs[th_inds]
+    batch_y = targets[th_inds]
+    return indices, batch_X, batch_y
