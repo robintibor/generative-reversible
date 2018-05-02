@@ -15,6 +15,17 @@ from reversible.ampphase import gaussian_to_uniform_phases_in_outs
 from reversible.gaussian import sizes_from_weights, sample_mixture_gaussian
 from reversible.util import var_to_np
 
+
+def get_all_outs(feature_model, inputs):
+    """Assumes sequential model"""
+    all_outs = [inputs]
+    cur_out = inputs
+    for module in feature_model.children():
+        cur_out = module(cur_out)
+        all_outs.append(cur_out)
+    return all_outs
+
+
 # from https://github.com/silvandeleemput/memcnn/blob/242478b9a55cd3617e8b795a8f6f5653a1ee485d/memcnn/models/revop.py
 class ReversibleBlock(nn.Module):
     def __init__(self, Fm, Gm=None, implementation=0, keep_input=False):
@@ -357,12 +368,14 @@ class ViewAs(th.nn.Module):
         return x.view(self.dims_after)
 
 
-def invert(feature_model, features):
+def invert(feature_model, features, return_all=False):
     if (feature_model.__class__.__name__ == 'ReversibleBlock') or \
             (feature_model.__class__.__name__ == 'SubsampleSplitter') or (
                 feature_model.__class__.__name__ == 'ReversibleBlockOld'
     ):
         feature_model = th.nn.Sequential(feature_model, )
+    all_features = []
+    all_features.append(features)
     for module in reversed(list(feature_model.children())):
         if module.__class__.__name__ == 'ReversibleBlockOld':
             n_chans = features.size()[1]
@@ -459,7 +472,12 @@ def invert(feature_model, features):
             assert len(module.padding) == 4
             left, right, top, bottom = module.padding  # see pytorch docs
             features = features[:, :, top:-bottom, left:-right]  # see pytorch docs
-    return features
+        if return_all:
+            all_features.append(features)
+    if return_all:
+        return all_features
+    else:
+        return features
 
 
 def get_inputs_from_reverted_samples(n_inputs, means_per_dim, stds_per_dim,

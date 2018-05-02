@@ -83,6 +83,13 @@ def select_outs_from_targets(outs, targets, i_cluster):
     return outs[(targets[:, i_cluster] == 1).unsqueeze(1)].view(
             -1, outs.size()[1])
 
+def select_from_targets(a, targets, i_cluster):
+    mask = targets[:, i_cluster] == 1
+    new_shape = (-1,) + a.size()[1:]
+    for _ in range(1, len(a.size())):
+        mask = mask.unsqueeze(1)
+    return a[mask].view(new_shape)
+
 
 def hard_init_std_mean(feature_model, inputs, targets, means_per_cluster,
                        stds_per_cluster, ):
@@ -111,4 +118,4 @@ def get_batch(inputs, targets, rng, batch_size, with_replacement, i_class='all',
     th_inds, _ = ensure_on_same_device(th_inds, inputs)
     batch_X = inputs[th_inds]
     batch_y = targets[th_inds]
-    return indices, batch_X, batch_y
+    return th_inds, batch_X, batch_y

@@ -13,3 +13,12 @@ def hard_loss_per_cluster(outs, targets, means_per_dim, stds_per_dim,
     return loss / float(len(means_per_dim))
 
 
+def pairwise_squared_dist_2d(a,b):
+    diffs = a.unsqueeze(1) - b.unsqueeze(0)
+    return th.sum(diffs * diffs, dim=2)
+
+
+def squared_dist_2d_matched(a,b):
+    diffs = a - b
+    return th.sum(diffs * diffs, dim=1)
+
