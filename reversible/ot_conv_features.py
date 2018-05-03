@@ -34,12 +34,12 @@ def sliced_loss_for_dirs_3d(samples_full_a, samples_full_b, directions):
     return w2_loss
 
 
-def layer_sliced_loss(this_all_outs, wanted_all_outs, return_all=False):
+def layer_sliced_loss(this_all_outs, wanted_all_outs, return_all=False, orthogonalize=True):
     layer_losses = []
     for i_layer in range(len(this_all_outs)):
         layer_outs = this_all_outs[i_layer]
         layer_wanted_outs = wanted_all_outs[i_layer]
-        directions = sample_directions(n_dims=layer_outs.size()[1], orthogonalize=True, cuda=True)
+        directions = sample_directions(n_dims=layer_outs.size()[1], orthogonalize=orthogonalize, cuda=True)
         samples_full_a = layer_outs.contiguous().view(layer_outs.size()[0], layer_outs.size()[1], -1).permute(0,2,1)
         samples_full_b = layer_wanted_outs.contiguous().view(
             layer_wanted_outs.size()[0],
