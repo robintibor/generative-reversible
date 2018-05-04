@@ -50,7 +50,8 @@ def sliced_from_samples_for_dirs(samples_a, samples_b, dirs):
     # (one W2-value per direction)
     # then mean across directions
     # then sqrt
-    loss = th.sqrt(th.mean(diffs * diffs))
+    eps = 1e-6
+    loss = th.sqrt(th.mean(diffs * diffs) + eps)
     return loss
 
 
@@ -68,7 +69,7 @@ def sliced_loss_for_dirs_3d(samples_full_a, samples_full_b, directions):
     eps = 1e-6
     # 
     #euclid_loss = th.mean(th.mean(th.sqrt(eps + th.mean((sorted_a - sorted_b) ** 2, dim=2)), dim=1), dim=0)
-    w2_loss = th.sqrt(th.mean(th.mean(th.mean((sorted_a - sorted_b) ** 2, dim=2), dim=1), dim=0))
+    w2_loss = th.sqrt(th.mean(th.mean(th.mean((sorted_a - sorted_b) ** 2, dim=2), dim=1), dim=0) + eps)
     return w2_loss
 
 
