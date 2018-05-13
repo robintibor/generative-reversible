@@ -1,6 +1,7 @@
 import torch as th
 import numpy as np
-from reversible.util import var_to_np
+from reversible.util import var_to_np, np_to_var, ensure_on_same_device
+
 
 def semi_dual_transport_loss(outs, mean, std):
     gauss_samples = get_gauss_samples(len(outs), mean, std)
@@ -62,3 +63,150 @@ def get_wanted_points_semi_dual(samples_discrete, samples_continuous, max_iters,
         wanted_points.data = wanted_points.data + (mask * min_matched.data)
 
     return wanted_points, v, n_points, i_iter
+
+
+def get_i_example_to_i_samples(diffs, v, optimizer_v, stop_min_bincount,
+                               stop_max_bincount, max_iters,
+                               collect_out_samples):
+    diffs = diffs.detach()
+    if max_iters == 0:
+        # just for collection
+        min_diffs, inds = th.min(diffs - v.unsqueeze(1), dim=0)
+
+    for i_iter in range(max_iters):
+        min_diffs, inds = th.min(diffs - v.unsqueeze(1), dim=0)
+        bincounts = np.bincount(var_to_np(inds), minlength=len(v))
+        if np.min(bincounts) >= stop_min_bincount:
+            break
+        if np.max(bincounts) <= stop_max_bincount:
+            break
+        loss = -(th.mean(min_diffs) + th.mean(v))
+        optimizer_v.zero_grad()
+        loss.backward()
+        optimizer_v.step()
+        v.data = v.data - th.mean(v.data)
+    if collect_out_samples:
+        i_example_to_i_samples = [[] for _ in range(diffs.size()[0])]
+        i_example_to_diffs = [[] for _ in range(diffs.size()[0])]
+        for i_sample, i_out in enumerate(inds):
+            i_example_to_i_samples[var_to_np(i_out)[0]].append(i_sample)
+            i_example_to_diffs[var_to_np(i_out)[0]].append(min_diffs[i_sample])
+    else:
+        i_example_to_i_samples = None
+        i_example_to_diffs = None
+    return i_example_to_i_samples, i_example_to_diffs
+
+
+def match_by_semidual_adam(diffs,v, stop_min_bincount=1,stop_max_bincount=4,
+        max_iters=200, collect_out_samples=True):
+    init_lr = var_to_np(th.mean(diffs) * 0.02)[0]
+    optimizer_v = th.optim.Adam([v], lr=init_lr)
+
+    i_example_to_i_samples, i_example_to_diffs = get_i_example_to_i_samples(
+        diffs,v, optimizer_v, stop_min_bincount=stop_min_bincount,
+        stop_max_bincount=stop_max_bincount,
+        collect_out_samples=collect_out_samples, max_iters=max_iters)
+    return i_example_to_i_samples
+
+
+def restrict_samples_to_max_n_per_example(i_example_to_i_samples, i_example_to_i_samples_2, max_n):
+    # reduce both arrays correctly
+    for i_example in range(len(i_example_to_i_samples)):
+        remaining_n = max_n
+        i_example_to_i_samples[i_example] = i_example_to_i_samples[i_example][:remaining_n]
+        remaining_n -= len(i_example_to_i_samples[i_example])
+        i_example_to_i_samples_2[i_example] = i_example_to_i_samples_2[i_example][:remaining_n]
+    return i_example_to_i_samples, i_example_to_i_samples_2
+
+
+def merge_samples(i_example_to_i_samples, i_example_to_i_samples_2, gauss_samples,
+                 gauss_samples_2):
+    inds_a = np.sort(np.concatenate(i_example_to_i_samples))
+    th_inds_a = np_to_var(inds_a, dtype=np.int64)
+    th_inds_a,  _ = ensure_on_same_device(
+        th_inds_a, gauss_samples)
+    samples_a = gauss_samples[th_inds_a]
+    inds_b = np.sort(np.concatenate(i_example_to_i_samples_2))
+    if len(inds_b) > 0:
+        th_inds_b = np_to_var(inds_b, dtype=np.int64)
+        th_inds_b,  _ = ensure_on_same_device(
+            th_inds_b, gauss_samples)
+        samples_b = gauss_samples_2[th_inds_b]
+    a_dict = dict([(val, i) for i,val in enumerate(inds_a)])
+    b_dict = dict([(val, i + len(a_dict)) for i,val in enumerate(inds_b)])
+    # merge samples
+    i_example_to_i_samples_merged = []
+    for i_example in range(len(i_example_to_i_samples)):
+        a_examples = [a_dict[i] for i in i_example_to_i_samples[i_example]]
+        b_examples = [b_dict[i] for i in i_example_to_i_samples_2[i_example]]
+        i_example_to_i_samples_merged.append(a_examples + b_examples)
+    if len(inds_b) > 0:
+        all_samples = th.cat((samples_a, samples_b), dim=0)
+    else:
+        all_samples = samples_a
+    return all_samples, i_example_to_i_samples_merged
+
+
+def collect_out_to_samples(diffs, v):
+    min_diffs, inds = th.min(diffs - v.unsqueeze(1), dim=0)
+    i_example_to_i_samples = [[] for _ in range(diffs.size()[0])]
+    i_example_to_diffs = [[] for _ in range(diffs.size()[0])]
+    for i_sample, i_out in enumerate(inds):
+        i_example_to_i_samples[var_to_np(i_out)[0]].append(i_sample)
+        i_example_to_diffs[var_to_np(i_out)[0]].append(min_diffs[i_sample])
+    return i_example_to_i_samples, i_example_to_diffs
+
+
+def collect_samples(outs, v, sample_fn, n_max, iters):
+    samples = sample_fn()
+    diffs = th.sum(
+        (outs.unsqueeze(dim=1) - samples.unsqueeze(dim=0)) ** 2,
+        dim=2)
+    i_example_to_i_samples, _ = collect_out_to_samples(diffs, v)
+    bincounts = []
+    bincounts.append(np.array([len(a) for a in i_example_to_i_samples]))
+    for _ in range(iters):
+        samples_2 = sample_fn()
+        diffs_2 = th.sum((outs.unsqueeze(dim=1) - samples_2.unsqueeze(
+                             dim=0)) ** 2, dim=2)
+        i_example_to_i_samples_2, _ = collect_out_to_samples(diffs_2, v)
+        bincounts.append(np.array([len(a) for a in i_example_to_i_samples_2]))
+        i_example_to_i_samples, i_example_to_i_samples_2 = restrict_samples_to_max_n_per_example(
+            i_example_to_i_samples, i_example_to_i_samples_2, n_max)
+        samples, i_example_to_i_samples = merge_samples(
+            i_example_to_i_samples, i_example_to_i_samples_2,
+            samples, samples_2)
+        lens = np.array([len(a) for a in i_example_to_i_samples])
+        assert len(samples) == np.sum(lens), (
+            "{:d} samples but {:d} assignments".format(len(samples), np.sum(lens)))
+        if len(samples) == n_max * len(outs):
+            assert np.all(lens == n_max), (
+                "Unique Lengths: {:s} from {:d} samples of {:d} samples".format(str(np.unique(lens)),
+                len(i_example_to_i_samples), len(samples)))
+            break
+    return samples, bincounts
+
+
+def optimize_v_optimizer(v, optim_v, outs, sample_fn, l1_threshold, max_iters=150):
+    exp_bin_counts = None
+    avg_v = th.zeros_like(v.data)
+    for i_update in range(max_iters):
+        samples = sample_fn()
+        diffs = th.sum((outs.unsqueeze(dim=1) - samples.unsqueeze(dim=0)) ** 2, dim=2)
+        min_diffs, inds = th.min(diffs - v.unsqueeze(1), dim=0)
+        bincounts = np.bincount(var_to_np(inds), minlength=len(v))
+        if exp_bin_counts is None:
+            exp_bin_counts = bincounts
+        exp_bin_counts = 0.75 * exp_bin_counts + 0.25 * bincounts
+        loss = -(th.mean(min_diffs) + th.mean(v))
+        optim_v.zero_grad()
+        loss.backward()
+        optim_v.step()
+        v.data = v.data - th.mean(v.data)
+        l1_bincount = np.mean(np.abs(exp_bin_counts - np.mean(exp_bin_counts)))
+        if l1_bincount < l1_threshold:
+            break
+        k = i_update + 1
+        avg_v = ((k-1) / k) * avg_v + (1/k) * v.data
+    return i_update, l1_bincount, avg_v
+

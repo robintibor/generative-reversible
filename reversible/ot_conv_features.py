@@ -44,12 +44,15 @@ def sliced_loss_for_dirs_3d(samples_full_a, samples_full_b, directions, diff_fn)
 
 def layer_sliced_loss(this_all_outs, wanted_all_outs, return_all=False, orthogonalize=True,
                     adv_dirs=None,
-                      diff_fn='w2'):
+                      diff_fn='w2',
+                      n_dirs=1):
     layer_losses = []
     for i_layer in range(len(this_all_outs)):
         layer_outs = this_all_outs[i_layer]
         layer_wanted_outs = wanted_all_outs[i_layer]
-        directions = sample_directions(n_dims=layer_outs.size()[1], orthogonalize=orthogonalize, cuda=True)
+        all_dirs = [sample_directions(n_dims=layer_outs.size()[1], orthogonalize=orthogonalize, cuda=True)
+                    for _ in range(n_dirs)]
+        directions = th.cat(all_dirs)
         if adv_dirs is not None:
             this_adv_dirs = norm_and_var_directions(adv_dirs[i_layer])
             directions = th.cat((directions, this_adv_dirs), dim=0)

@@ -12,10 +12,13 @@ def ot_emd_loss(outs, mean, std):
     diffs = th.sum(diffs * diffs, dim=2)
 
     transport_mat = ot.emd([],[], var_to_np(diffs))
+    # sometimes weird low values, try to prevent them
+    transport_mat = transport_mat * (transport_mat > (1.0/(diffs.numel())))
 
     transport_mat = np_to_var(transport_mat, dtype=np.float32)
     diffs, transport_mat = ensure_on_same_device(diffs, transport_mat)
-    loss = th.sqrt(th.sum(transport_mat * diffs))
+    eps = 1e-6
+    loss = th.sqrt(th.sum(transport_mat * diffs) + eps)
     return loss
 
 
@@ -24,10 +27,13 @@ def ot_emd_loss_for_samples(samples_a, samples_b):
     diffs = th.sum(diffs * diffs, dim=2)
 
     transport_mat = ot.emd([], [], var_to_np(diffs))
+    # sometimes weird low values, try to prevent them
+    transport_mat = transport_mat * (transport_mat > (1.0/(diffs.numel())))
 
     transport_mat = np_to_var(transport_mat, dtype=np.float32)
     diffs, transport_mat = ensure_on_same_device(diffs, transport_mat)
-    loss = th.sqrt(th.sum(transport_mat * diffs))
+    eps = 1e-6
+    loss = th.sqrt(th.sum(transport_mat * diffs) + eps)
     return loss
 
 
@@ -42,6 +48,8 @@ def ot_euclidean_loss(outs, mean, std, normalize_by_global_emp_std=False):
     diffs = th.sqrt(th.clamp(th.sum(diffs * diffs, dim=2), min=1e-6))
 
     transport_mat = ot.emd([],[], var_to_np(diffs))
+    # sometimes weird low values, try to prevent them
+    transport_mat = transport_mat * (transport_mat > (1.0/(diffs.numel())))
 
     transport_mat = np_to_var(transport_mat, dtype=np.float32)
     diffs, transport_mat = ensure_on_same_device(diffs, transport_mat)
@@ -68,6 +76,8 @@ def ot_euclidean_loss_for_samples(samples_a, samples_b):
     diffs = th.sqrt(th.clamp(th.sum(diffs * diffs, dim=2), min=1e-6))
 
     transport_mat = ot.emd([], [], var_to_np(diffs))
+    # sometimes weird low values, try to prevent them
+    transport_mat = transport_mat * (transport_mat > (1.0/(diffs.numel())))
 
     transport_mat = np_to_var(transport_mat, dtype=np.float32)
     diffs, transport_mat = ensure_on_same_device(diffs, transport_mat)
@@ -80,6 +90,8 @@ def ot_euclidean_transport_mat(samples_a, samples_b):
     diffs = th.sqrt(th.clamp(th.sum(diffs * diffs, dim=2), min=1e-6))
 
     transport_mat = ot.emd([], [], var_to_np(diffs))
+    # sometimes weird low values, try to prevent them
+    transport_mat = transport_mat * (transport_mat > (1.0/(diffs.numel())))
 
     transport_mat = np_to_var(transport_mat, dtype=np.float32)
     diffs, transport_mat = ensure_on_same_device(diffs, transport_mat)
@@ -91,6 +103,8 @@ def ot_squared_diff_transport_mat(samples_a, samples_b):
     diffs = th.sum(diffs * diffs, dim=2)
 
     transport_mat = ot.emd([], [], var_to_np(diffs))
+    # sometimes weird low values, try to prevent them
+    transport_mat = transport_mat * (transport_mat > (1.0/(diffs.numel())))
 
     transport_mat = np_to_var(transport_mat, dtype=np.float32)
     diffs, transport_mat = ensure_on_same_device(diffs, transport_mat)
@@ -112,3 +126,13 @@ def get_wanted_points_from_transport_mat(transport_mat, samples_matched):
     wanted_points = th.sum(
         transport_mat.unsqueeze(2) * samples_matched.unsqueeze(0), dim=1)
     return wanted_points
+
+
+def transport_mat_from_diffs(diffs):
+    transport_mat = ot.emd([], [], var_to_np(diffs))
+    # sometimes weird low values, try to prevent them
+    transport_mat = transport_mat * (transport_mat > (1.0/(diffs.numel())))
+
+    transport_mat = np_to_var(transport_mat, dtype=np.float32)
+    diffs, transport_mat = ensure_on_same_device(diffs, transport_mat)
+    return transport_mat

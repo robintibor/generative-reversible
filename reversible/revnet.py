@@ -12,7 +12,9 @@ import numpy as np
 
 from reversible.ampphase import amp_phase_to_x_y
 from reversible.ampphase import gaussian_to_uniform_phases_in_outs
-from reversible.gaussian import sizes_from_weights, sample_mixture_gaussian
+from reversible.gaussian import sizes_from_weights, sample_mixture_gaussian, \
+    get_gauss_samples
+from reversible.uniform import get_uniform_samples
 from reversible.util import var_to_np
 
 
@@ -497,6 +499,22 @@ def get_inputs_from_reverted_samples(n_inputs, means_per_dim, stds_per_dim,
     rec_var = invert(feature_model, gauss_samples)
     rec_examples = var_to_np(rec_var).squeeze()
     return rec_examples, gauss_samples
+
+
+def get_inputs_from_gaussian_samples(n_inputs, mean, std,
+                                     feature_model):
+    gauss_samples = get_gauss_samples(n_inputs, mean, std)
+    inverted = invert(feature_model, gauss_samples)
+    rec_examples = var_to_np(inverted).squeeze()
+    return rec_examples, gauss_samples
+
+
+def get_inputs_from_uniform_samples(n_inputs, mean, std,
+                                     feature_model):
+    uniform_samples = get_uniform_samples(n_inputs, mean, std)
+    inverted = invert(feature_model, uniform_samples)
+    rec_examples = var_to_np(inverted).squeeze()
+    return rec_examples, uniform_samples
 
 
 def weights_init(module, conv_weight_init_fn):

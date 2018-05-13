@@ -29,7 +29,7 @@ def norm_and_var_directions(directions):
 
 
 def sliced_from_samples(samples_a, samples_b, n_dirs, adv_dirs,
-                        orthogonalize=True):
+                        orthogonalize=True, dist='w2'):
     assert (n_dirs > 0) or (adv_dirs is not None)
     dirs = [sample_directions(samples_a.size()[1], orthogonalize=orthogonalize,
                               cuda=samples_a.is_cuda) for _ in range(n_dirs)]
@@ -37,10 +37,11 @@ def sliced_from_samples(samples_a, samples_b, n_dirs, adv_dirs,
         dirs = dirs + [adv_dirs]
     dirs = th.cat(dirs, dim=0)
     dirs = norm_and_var_directions(dirs)
-    return sliced_from_samples_for_dirs(samples_a, samples_b, dirs)
+    return sliced_from_samples_for_dirs(samples_a, samples_b, dirs, dist=dist)
 
 
-def sliced_from_samples_for_dirs(samples_a, samples_b, dirs):
+def sliced_from_samples_for_dirs(samples_a, samples_b, dirs, dist):
+    assert dist in ['w2', 'sqw2']
     projected_samples_a = th.mm(samples_a, dirs.t())
     sorted_samples_a, _ = th.sort(projected_samples_a, dim=0)
     projected_samples_b = th.mm(samples_b, dirs.t())
@@ -50,8 +51,12 @@ def sliced_from_samples_for_dirs(samples_a, samples_b, dirs):
     # (one W2-value per direction)
     # then mean across directions
     # then sqrt
-    eps = 1e-6
-    loss = th.sqrt(th.mean(diffs * diffs) + eps)
+    if dist == 'w2':
+        eps = 1e-6
+        loss = th.sqrt(th.mean(diffs * diffs) + eps)
+    else:
+        assert dist == 'sqw2'
+        loss = th.mean(diffs * diffs)
     return loss
 
 
@@ -60,20 +65,25 @@ def sliced_from_samples_for_gauss_dist(outs, mean, std, n_dirs, adv_dirs, **kwar
     return sliced_from_samples(outs, gauss_samples, n_dirs, adv_dirs, **kwargs)
 
 
-def sliced_loss_for_dirs_3d(samples_full_a, samples_full_b, directions):
+def sliced_loss_for_dirs_3d(samples_full_a, samples_full_b, directions, dist):
+    assert dist in ['w2', 'sqw2']
     proj_a = th.matmul(samples_full_a, directions.t())
     proj_b = th.matmul(samples_full_b, directions.t())
     sorted_a, _ = th.sort(proj_a, dim=1)
     sorted_b, _ = th.sort(proj_b, dim=1)
     # sorted are examples x locations x dirs
-    eps = 1e-6
     # 
     #euclid_loss = th.mean(th.mean(th.sqrt(eps + th.mean((sorted_a - sorted_b) ** 2, dim=2)), dim=1), dim=0)
-    w2_loss = th.sqrt(th.mean(th.mean(th.mean((sorted_a - sorted_b) ** 2, dim=2), dim=1), dim=0) + eps)
-    return w2_loss
+    if dist == 'w2':
+        eps = 1e-6
+        loss = th.sqrt(th.mean((sorted_a - sorted_b) ** 2) + eps)
+    else:
+        assert dist == 'sqw2'
+        loss = th.mean((sorted_a - sorted_b) ** 2)
+    return loss
 
 
-def layer_sliced_loss(this_all_outs, wanted_all_outs):
+def layer_sliced_loss(this_all_outs, wanted_all_outs, dist='w2'):
     layer_losses = []
     # could also think to exclude second to last layer as well
     # as it is just last viewed in different shape
@@ -86,7 +96,8 @@ def layer_sliced_loss(this_all_outs, wanted_all_outs):
             layer_wanted_outs.size()[0],
             layer_wanted_outs.size()[1],
             -1).permute(0,2,1)
-        layer_loss = sliced_loss_for_dirs_3d(samples_full_a, samples_full_b, directions)
+        layer_loss = sliced_loss_for_dirs_3d(samples_full_a, samples_full_b, directions,
+                                             dist=dist)
         layer_losses.append(layer_loss)
     total_loss = th.mean(th.cat(layer_losses, dim=0))
     return total_los

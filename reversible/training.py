@@ -7,6 +7,15 @@ from reversible.sliced import sample_directions
 from reversible.util import ensure_on_same_device
 
 
+def compute_embedding_loss(diffs, i_example_to_i_samples):
+    main_loss = 0
+    for i_example, i_samples in enumerate(i_example_to_i_samples):
+        for i_sample in i_samples:
+            main_loss += diffs[i_example, i_sample]
+    main_loss = th.sqrt(main_loss / diffs.size()[0] + 1e-6)
+    return main_loss
+
+
 class GenerativeRevTrainer(object):
     def __init__(self, model, optimizer, means_per_dim, stds_per_dim,
                  iterator):

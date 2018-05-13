@@ -1,7 +1,9 @@
 import torch as th
 import numpy as np
 
-
+# in case you want truncated, see
+#https://discuss.pytorch.org/t/implementing-truncated-normal-initializer/4778/12
+# torch.fmod(torch.randn(size),2) (or torch.fmod stdf aft
 def get_gauss_samples(n_samples, mean, std):
     if mean.is_cuda:
         orig_samples = th.cuda.FloatTensor(n_samples, len(mean)).normal_(0, 1)
