@@ -190,28 +190,37 @@ def collect_samples(outs, v, sample_fn, n_max, iters):
     return samples, bincounts
 
 
-def optimize_v_optimizer(v, optim_v, outs, sample_fn, l1_threshold, max_iters=150):
+def sample_match_and_bincount(outs, v, sample_fn, iters):
+    samples = sample_fn()
+    diffs = th.sum(
+        (outs.unsqueeze(dim=1) - samples.unsqueeze(dim=0)) ** 2,
+        dim=2)
+    i_example_to_i_samples, _ = collect_out_to_samples(diffs, v)
+    bincounts = []
+    bincounts.append(np.array([len(a) for a in i_example_to_i_samples]))
+    for _ in range(iters):
+        samples_2 = sample_fn()
+        diffs_2 = th.sum((outs.unsqueeze(dim=1) - samples_2.unsqueeze(
+            dim=0)) ** 2, dim=2)
+        i_example_to_i_samples_2, _ = collect_out_to_samples(diffs_2, v)
+        bincounts.append(np.array([len(a) for a in i_example_to_i_samples_2]))
+    return bincounts
+
+def optimize_v_optimizer(v, optim_v, outs, sample_fn, max_iters=150):
     exp_bin_counts = None
     avg_v = th.zeros_like(v.data)
     for i_update in range(max_iters):
         samples = sample_fn()
         diffs = th.sum((outs.unsqueeze(dim=1) - samples.unsqueeze(dim=0)) ** 2, dim=2)
         min_diffs, inds = th.min(diffs - v.unsqueeze(1), dim=0)
-        bincounts = np.bincount(var_to_np(inds), minlength=len(v))
-        if exp_bin_counts is None:
-            exp_bin_counts = bincounts
-        exp_bin_counts = 0.75 * exp_bin_counts + 0.25 * bincounts
         loss = -(th.mean(min_diffs) + th.mean(v))
         optim_v.zero_grad()
         loss.backward()
         optim_v.step()
         v.data = v.data - th.mean(v.data)
-        l1_bincount = np.mean(np.abs(exp_bin_counts - np.mean(exp_bin_counts)))
-        if l1_bincount < l1_threshold:
-            break
         k = i_update + 1
         avg_v = ((k-1) / k) * avg_v + (1/k) * v.data
-    return i_update, l1_bincount, avg_v
+    return i_update,  avg_v
 
 
 def optimize_v_adaptively(outs, v, sample_fn, bin_dev_threshold):
@@ -229,16 +238,16 @@ def optimize_v_adaptively(outs, v, sample_fn, bin_dev_threshold):
     # after, do 20, check l1 with 8, do 20, check l1 with 8
     # if below 1, finish
 
-    i_updates, bincount_deviation, avg_v = optimize_v_optimizer(
-      v, optim_v, outs.detach(), sample_fn, l1_threshold=0, max_iters=25)
+    i_updates, avg_v = optimize_v_optimizer(
+      v, optim_v, outs.detach(), sample_fn, max_iters=25)
     v.data = avg_v
     n_updates_total += i_updates + 1
     for _ in range(10):
-        i_updates, bincount_deviation, avg_v = optimize_v_optimizer(
-            v, optim_v, outs.detach(), sample_fn, l1_threshold=0, max_iters=20)
+        i_updates, avg_v = optimize_v_optimizer(
+            v, optim_v, outs.detach(), sample_fn, max_iters=20)
         n_updates_total += i_updates + 1
         v.data = avg_v
-        gauss_samples, bincounts = collect_samples(outs.detach(), v, sample_fn, n_max=1, iters=10)
+        bincounts = sample_match_and_bincount(outs.detach(), v, sample_fn, iters=10)
         bin_dev = np.mean(np.abs(bincounts - np.mean(bincounts)))
         if bin_dev < bin_dev_threshold:
             break
