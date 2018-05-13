@@ -1,5 +1,7 @@
 import torch as th
 import numpy as np
+
+from reversible.schedulers import ScheduledOptimizer, DivideSqrtUpdates
 from reversible.util import var_to_np, np_to_var, ensure_on_same_device
 
 
@@ -149,11 +151,12 @@ def merge_samples(i_example_to_i_samples, i_example_to_i_samples_2, gauss_sample
 
 def collect_out_to_samples(diffs, v):
     min_diffs, inds = th.min(diffs - v.unsqueeze(1), dim=0)
+    inds = var_to_np(inds)
     i_example_to_i_samples = [[] for _ in range(diffs.size()[0])]
     i_example_to_diffs = [[] for _ in range(diffs.size()[0])]
     for i_sample, i_out in enumerate(inds):
-        i_example_to_i_samples[var_to_np(i_out)[0]].append(i_sample)
-        i_example_to_diffs[var_to_np(i_out)[0]].append(min_diffs[i_sample])
+        i_example_to_i_samples[i_out].append(i_sample)
+        i_example_to_diffs[i_out].append(min_diffs[i_sample])
     return i_example_to_i_samples, i_example_to_diffs
 
 
@@ -209,4 +212,36 @@ def optimize_v_optimizer(v, optim_v, outs, sample_fn, l1_threshold, max_iters=15
         k = i_update + 1
         avg_v = ((k-1) / k) * avg_v + (1/k) * v.data
     return i_update, l1_bincount, avg_v
+
+
+def optimize_v_adaptively(outs, v, sample_fn, bin_dev_threshold):
+    # Optimize V
+    n_updates_total = 0
+    outs = outs.detach()
+    gauss_samples = sample_fn()
+    diffs = th.sum((outs.unsqueeze(dim=1) - gauss_samples.unsqueeze(dim=0)) ** 2, dim=2)
+    init_lr = float(var_to_np(th.mean(th.min(diffs, dim=1)[0]))[0])
+    optim_v_orig = th.optim.SGD([v], lr=init_lr)
+    optim_v = ScheduledOptimizer(DivideSqrtUpdates(), optim_v_orig, True)
+
+    # for now:
+    # do 20, with lr= mean(mindiffs)
+    # after, do 20, check l1 with 8, do 20, check l1 with 8
+    # if below 1, finish
+
+    i_updates, bincount_deviation, avg_v = optimize_v_optimizer(
+      v, optim_v, outs.detach(), sample_fn, l1_threshold=0, max_iters=25)
+    v.data = avg_v
+    n_updates_total += i_updates + 1
+    for _ in range(10):
+        i_updates, bincount_deviation, avg_v = optimize_v_optimizer(
+            v, optim_v, outs.detach(), sample_fn, l1_threshold=0, max_iters=20)
+        n_updates_total += i_updates + 1
+        v.data = avg_v
+        gauss_samples, bincounts = collect_samples(outs.detach(), v, sample_fn, n_max=1, iters=10)
+        bin_dev = np.mean(np.abs(bincounts - np.mean(bincounts)))
+        if bin_dev < bin_dev_threshold:
+            break
+    return bincounts, bin_dev, n_updates_total
+
 
