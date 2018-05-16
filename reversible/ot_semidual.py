@@ -1,6 +1,7 @@
 import torch as th
 import numpy as np
 
+from reversible.gaussian import get_gauss_samples
 from reversible.schedulers import ScheduledOptimizer, DivideSqrtUpdates
 from reversible.util import var_to_np, np_to_var, ensure_on_same_device
 
@@ -84,19 +85,13 @@ def collect_samples(outs, v, sample_fn, n_max, iters):
 
 
 def sample_match_and_bincount(outs, v, sample_fn, iters):
-    samples = sample_fn()
-    diffs = th.sum(
-        (outs.unsqueeze(dim=1) - samples.unsqueeze(dim=0)) ** 2,
-        dim=2)
-    i_example_to_i_samples, _ = collect_out_to_samples(diffs, v)
     bincounts = []
-    bincounts.append(np.array([len(a) for a in i_example_to_i_samples]))
     for _ in range(iters):
-        samples_2 = sample_fn()
-        diffs_2 = th.sum((outs.unsqueeze(dim=1) - samples_2.unsqueeze(
+        samples = sample_fn()
+        diffs = th.sum((outs.unsqueeze(dim=1) - samples.unsqueeze(
             dim=0)) ** 2, dim=2)
-        i_example_to_i_samples_2, _ = collect_out_to_samples(diffs_2, v)
-        bincounts.append(np.array([len(a) for a in i_example_to_i_samples_2]))
+        i_example_to_i_samples, _ = collect_out_to_samples(diffs, v)
+        bincounts.append(np.array([len(a) for a in i_example_to_i_samples]))
     return bincounts
 
 
@@ -124,14 +119,9 @@ def optimize_v_adaptively(outs, v, sample_fn_opt, sample_fn_bin_dev,
     outs = outs.detach()
     gauss_samples = sample_fn_bin_dev()
     diffs = th.sum((outs.unsqueeze(dim=1) - gauss_samples.unsqueeze(dim=0)) ** 2, dim=2)
-    init_lr = float(var_to_np(th.mean(th.min(diffs, dim=1)[0]))[0])
+    init_lr = float(var_to_np(th.mean(th.min(diffs, dim=1)[0]))[0] * len(outs) / 50)
     optim_v_orig = th.optim.SGD([v], lr=init_lr)
     optim_v = ScheduledOptimizer(DivideSqrtUpdates(), optim_v_orig, True)
-
-    # for now:
-    # do 20, with lr= mean(mindiffs)
-    # after, do 20, check l1 with 8, do 20, check l1 with 8
-    # if below 1, finish
 
     i_updates, avg_v = optimize_v_optimizer(
       v, optim_v, outs.detach(), sample_fn_opt, max_iters=25)
@@ -139,13 +129,37 @@ def optimize_v_adaptively(outs, v, sample_fn_opt, sample_fn_bin_dev,
     n_updates_total += i_updates + 1
     for _ in range(10):
         v.data = avg_v
-        bincounts = sample_match_and_bincount(outs.detach(), v, sample_fn_bin_dev, iters=bin_dev_iters)
+        bincounts = sample_match_and_bincount(outs, v, sample_fn_bin_dev, iters=bin_dev_iters)
         bin_dev = np.mean(np.abs(bincounts - np.mean(bincounts)))
         if bin_dev < bin_dev_threshold:
             break
         i_updates, avg_v = optimize_v_optimizer(
             v, optim_v, outs.detach(), sample_fn_opt, max_iters=20)
         n_updates_total += i_updates + 1
+        v.data = avg_v
     return bincounts, bin_dev, n_updates_total
 
 
+def optimize_v(outs_main, means_per_cluster, stds_per_cluster, v, i_class,
+               n_wanted_stds, norm_std_to):
+    means_reduced, stds_reduced, largest_stds = reduce_dims_to_large_stds(
+        means_per_cluster, stds_per_cluster, i_class, n_wanted_stds, norm_std_to=norm_std_to)
+    outs_reduced = outs_main.index_select(dim=1, index=largest_stds)
+    sample_fn_dt = lambda: get_gauss_samples(
+        len(outs_reduced) * 1, means_reduced.detach(), stds_reduced.detach())
+    bincounts, bin_dev, n_updates = optimize_v_adaptively(
+        outs_reduced.detach(), v, sample_fn_dt, sample_fn_dt,
+        bin_dev_threshold=0.75, bin_dev_iters=5)
+    return bincounts, bin_dev, n_updates
+
+
+def reduce_dims_to_large_stds(means_per_cluster, stds_per_cluster, i_class,
+                              n_wanted_stds, norm_std_to):
+    this_std = stds_per_cluster[i_class] * stds_per_cluster[i_class]
+    _,i_std_sorted = th.sort(this_std)
+    largest_stds = i_std_sorted[-n_wanted_stds:]
+    if norm_std_to is not None:
+        this_std = norm_std_to * this_std / th.sum(this_std)
+    stds_reduced = this_std[largest_stds]
+    means_reduced = means_per_cluster[i_class][largest_stds]
+    return means_reduced, stds_reduced, largest_stds

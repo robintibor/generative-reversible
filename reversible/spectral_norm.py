@@ -13,27 +13,30 @@ def l2normalize(v, eps=1e-12):
 
 
 class SpectralNorm(nn.Module):
-    def __init__(self, module, name='weight', power_iterations=1):
+    def __init__(self, module, name='weight', power_iterations=1, to_norm=1):
         super(SpectralNorm, self).__init__()
         self.module = module
         self.name = name
         self.power_iterations = power_iterations
         if not self._made_params():
             self._make_params()
+        self.to_norm = to_norm
 
-    def _update_u_v(self):
+    def _update_u_v(self, power_iterations=None):
+        if power_iterations is None:
+            power_iterations = self.power_iterations
         u = getattr(self.module, self.name + "_u")
         v = getattr(self.module, self.name + "_v")
         w = getattr(self.module, self.name + "_bar")
 
         height = w.data.shape[0]
-        for _ in range(self.power_iterations):
+        for _ in range(power_iterations):
             v.data = l2normalize(torch.mv(torch.t(w.view(height,-1).data), u.data))
             u.data = l2normalize(torch.mv(w.view(height,-1).data, v.data))
 
         # sigma = torch.dot(u.data, torch.mv(w.view(height,-1).data, v.data))
         sigma = u.dot(w.view(height, -1).mv(v))
-        setattr(self.module, self.name, w / sigma.expand_as(w))
+        setattr(self.module, self.name, self.to_norm * w / sigma.expand_as(w))
 
     def _made_params(self):
         try:

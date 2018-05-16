@@ -5,9 +5,9 @@ from reversible.gaussian import get_gauss_samples
 
 def sample_directions(n_dims, orthogonalize, cuda):
     if cuda:
-        directions = th.cuda.FloatTensor(n_dims, n_dims).normal_(0, 1)
+        directions = th.cuda.FloatTensor(n_dims, n_dims).normal_(0, 1) + 1e-6
     else:
-        directions = th.FloatTensor(n_dims, n_dims).normal_(0, 1)
+        directions = th.FloatTensor(n_dims, n_dims).normal_(0, 1) + 1e-6
 
     if orthogonalize:
         directions, r = th.qr(directions)
@@ -46,6 +46,23 @@ def sliced_from_samples_for_dirs(samples_a, samples_b, dirs, dist):
     sorted_samples_a, _ = th.sort(projected_samples_a, dim=0)
     projected_samples_b = th.mm(samples_b, dirs.t())
     sorted_samples_b, _ = th.sort(projected_samples_b, dim=0)
+    n_a = len(sorted_samples_a)
+    n_b = len(sorted_samples_b)
+    if n_a > n_b:
+        assert n_a % n_b == 0
+        increase_factor = n_a // n_b
+        sorted_samples_a = sorted_samples_a.view(n_a // increase_factor,
+                                                 increase_factor,
+                                                 sorted_samples_a.size()[1])
+        sorted_samples_b = sorted_samples_b.unsqueeze(1)
+    elif n_a < n_b:
+        assert n_b % n_a == 0
+        increase_factor = n_b // n_a
+        sorted_samples_b = sorted_samples_b.view(n_b // increase_factor,
+                                                 increase_factor,
+                                                 sorted_samples_b.size()[1])
+        sorted_samples_a = sorted_samples_a.unsqueeze(1)
+
     diffs = sorted_samples_a - sorted_samples_b
     # first sum across examples
     # (one W2-value per direction)

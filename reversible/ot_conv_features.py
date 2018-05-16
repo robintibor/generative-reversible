@@ -68,3 +68,8 @@ def layer_sliced_loss(this_all_outs, wanted_all_outs, return_all=False, orthogon
     else:
         total_loss = th.mean(th.cat(layer_losses, dim=0))
         return total_loss
+
+def to_one_out_per_layer(l_outs):
+    reshaped_l_outs = [l_out.transpose(1, 0).unsqueeze(0) for l_out in
+                       l_outs]
+    return reshaped_l_outs
