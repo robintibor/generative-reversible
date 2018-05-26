@@ -28,17 +28,30 @@ def sliced_loss_for_dirs_3d(samples_full_a, samples_full_b, directions, diff_fn)
     sorted_a, _ = th.sort(proj_a, dim=1)
     sorted_b, _ = th.sort(proj_b, dim=1)
     # sorted are examples x locations x dirs
+    n_a = len(sorted_a)
+    n_b = len(sorted_b)
+    if n_a > n_b:
+        assert n_a % n_b == 0
+        increase_factor = n_a // n_b
+        sorted_a = sorted_a.view(n_a // increase_factor,
+                                 increase_factor,
+                                 sorted_a.size()[1],
+                                 sorted_a.size()[2])
+        sorted_b = sorted_b.unsqueeze(1)
+    elif n_a < n_b:
+        assert n_b % n_a == 0
+        increase_factor = n_b // n_a
+        sorted_b = sorted_b.view(n_b // increase_factor,
+                                 increase_factor,
+                                 sorted_b.size()[1],
+                                 sorted_b.size()[2])
+        sorted_a = sorted_a.unsqueeze(1)
 
-    #eps = 1e-6
-    #euclid_loss = th.mean(th.mean(th.sqrt(eps + th.mean((sorted_a - sorted_b) ** 2, dim=2)), dim=1), dim=0)
     if diff_fn == 'w2':
         eps = 1e-6
-        loss = th.sqrt(th.mean(th.mean(th.mean((sorted_a - sorted_b) ** 2, dim=2), dim=1), dim=0)+ eps)
+        loss = th.sqrt(th.mean((sorted_a - sorted_b) ** 2) + eps)
     elif diff_fn == 'sqw2':
-        loss = th.mean(th.mean(th.mean((sorted_a - sorted_b) ** 2, dim=2), dim=1), dim=0)
-    elif diff_fn == 'fakeeuclid':
-        eps = 1e-6
-        loss = th.mean(th.mean(th.sqrt(th.sum((sorted_a - sorted_b) ** 2, dim=2)+ eps), dim=1), dim=0)
+        loss = th.mean((sorted_a - sorted_b) ** 2)
     return loss
 
 
@@ -73,3 +86,15 @@ def to_one_out_per_layer(l_outs):
     reshaped_l_outs = [l_out.transpose(1, 0).unsqueeze(0) for l_out in
                        l_outs]
     return reshaped_l_outs
+
+
+def pixels_to_batch(l_out):
+    return l_out.transpose(0,1).contiguous().view(l_out.size()[1], -1).transpose(0,1)
+
+
+def choose(pixels, n_max):
+    if len(pixels) > n_max:
+        inds = th.randperm(len(pixels))[:n_max].cuda()
+        return pixels[inds]
+    else:
+        return pixels

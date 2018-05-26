@@ -68,5 +68,8 @@ class SpectralNorm(nn.Module):
 
 
     def forward(self, *args):
-        self._update_u_v()
+        if self.training:
+            self._update_u_v()
+        else:
+            self._update_u_v(power_iterations=0)
         return self.module.forward(*args)
