@@ -2,6 +2,9 @@ import numpy as np
 from numpy.random import RandomState
 import torch as th
 
+from reversible.util import np_to_var
+
+
 class GenerativeIterator(object):
     def __init__(self, upsample_supervised, batch_size):
         self.upsample_supervised = upsample_supervised
@@ -141,3 +144,38 @@ def get_balanced_batches(n_trials, rng, shuffle, n_batches=None,
         i_start_trial = i_stop_trial
     assert i_start_trial == n_trials
     return batches
+
+
+class BalancedBatchSizeIterator(object):
+    """
+    Create batches of balanced size.
+
+    Parameters
+    ----------
+    batch_size: int
+        Resulting batches will not necessarily have the given batch size
+        but rather the next largest batch size that allows to split the set into
+        balanced batches (maximum size difference 1).
+    """
+
+    def __init__(self, batch_size):
+        self.batch_size = batch_size
+        self.rng = RandomState(328774)
+
+    def get_batches(self, X, y, shuffle):
+        n_trials = len(X)
+        batches = get_balanced_batches(n_trials,
+                                       batch_size=self.batch_size,
+                                       rng=self.rng,
+                                       shuffle=shuffle)
+        for batch_inds in batches:
+            batch_inds = np_to_var(batch_inds, dtype=np.int64)
+            if X.is_cuda:
+                batch_inds = batch_inds.cuda()
+            batch_X = X[batch_inds]
+            batch_y = y[batch_inds]
+
+            yield (batch_X, batch_y)
+
+    def reset_rng(self):
+        self.rng = RandomState(328774)
