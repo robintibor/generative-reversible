@@ -113,30 +113,37 @@ def optimize_v_optimizer(v, optim_v, outs, sample_fn, max_iters=150):
 
 def optimize_v_adaptively(outs, v, sample_fn_opt, sample_fn_bin_dev,
                           bin_dev_threshold,
-                          bin_dev_iters):
+                          bin_dev_iters, init_lr=None, v_opt_iters=25,
+                          repeat_iters=10):
     # Optimize V
     n_updates_total = 0
     outs = outs.detach()
     gauss_samples = sample_fn_bin_dev()
     diffs = th.sum((outs.unsqueeze(dim=1) - gauss_samples.unsqueeze(dim=0)) ** 2, dim=2)
-    init_lr = float(var_to_np(th.mean(th.min(diffs, dim=1)[0]))[0] * len(outs) / 50)
+    if init_lr is None:
+        init_lr = float(var_to_np(th.mean(th.min(diffs, dim=1)[0]))[0] * len(outs) / 50)
     optim_v_orig = th.optim.SGD([v], lr=init_lr)
     optim_v = ScheduledOptimizer(DivideSqrtUpdates(), optim_v_orig, True)
 
     i_updates, avg_v = optimize_v_optimizer(
-      v, optim_v, outs.detach(), sample_fn_opt, max_iters=25)
+      v, optim_v, outs.detach(), sample_fn_opt, max_iters=v_opt_iters)
     v.data = avg_v
     n_updates_total += i_updates + 1
-    for _ in range(10):
+    for _ in range(repeat_iters):
         v.data = avg_v
         bincounts = sample_match_and_bincount(outs, v, sample_fn_bin_dev, iters=bin_dev_iters)
         bin_dev = np.mean(np.abs(bincounts - np.mean(bincounts)))
         if bin_dev < bin_dev_threshold:
             break
         i_updates, avg_v = optimize_v_optimizer(
-            v, optim_v, outs.detach(), sample_fn_opt, max_iters=20)
+            v, optim_v, outs.detach(), sample_fn_opt, max_iters=v_opt_iters)
         n_updates_total += i_updates + 1
         v.data = avg_v
+    if repeat_iters == 0:
+        v.data = avg_v
+        bincounts = sample_match_and_bincount(outs, v, sample_fn_bin_dev, iters=bin_dev_iters)
+        bin_dev = np.mean(np.abs(bincounts - np.mean(bincounts)))
+
     return bincounts, bin_dev, n_updates_total
 
 

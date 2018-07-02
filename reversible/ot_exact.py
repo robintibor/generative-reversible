@@ -32,7 +32,7 @@ def ot_emd_loss_for_samples(samples_a, samples_b):
 
     transport_mat = np_to_var(transport_mat, dtype=np.float32)
     diffs, transport_mat = ensure_on_same_device(diffs, transport_mat)
-    eps = 1e-6
+    eps = 1e-8
     loss = th.sqrt(th.sum(transport_mat * diffs) + eps)
     return loss
 
