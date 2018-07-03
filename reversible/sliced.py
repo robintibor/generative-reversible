@@ -1,7 +1,5 @@
 import torch as th
 
-from reversible.gaussian import get_gauss_samples
-
 
 def sample_directions(n_dims, orthogonalize, cuda):
     if cuda:
@@ -75,8 +73,3 @@ def sliced_from_samples_for_dirs(samples_a, samples_b, dirs, dist):
         assert dist == 'sqw2'
         loss = th.mean(diffs * diffs)
     return loss
-
-
-def sliced_from_samples_for_gauss_dist(outs, mean, std, n_dirs, adv_dirs, **kwargs):
-    gauss_samples = get_gauss_samples(len(outs), mean, std)
-    return sliced_from_samples(outs, gauss_samples, n_dirs, adv_dirs, **kwargs)
