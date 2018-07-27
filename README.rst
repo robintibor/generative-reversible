@@ -2,6 +2,13 @@ Training Generative Reversible Networks
 =======================================
 This repository contains code accompanying the paper `Training Generative Reversible Networks <https://arxiv.org/abs/1806.01610>`_.
 
+Installation
+------------
+
+1. Install `Pytorch 0.4  <http://pytorch.org/>`_.
+2. Install other dependencies such as numpy, matplotlib, seaborn, etc.
+3. Add this repository to your PYTHONPATH
+
 Run
 ------
 
