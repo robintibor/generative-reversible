@@ -1,9 +1,10 @@
-# Training Generative Reversible Networks
+Training Generative Reversible Networks
+=======================================
 This repository contains code accompanying the paper
 [Training Generative Reversible Networks](https://arxiv.org/abs/1806.01610).
 
 Run
-=====
+------
 To reproduce the CelebA results, first run the notebooks under notebooks/celeba:
 1. [Only_Clamp.ipynb](https://github.com/robintibor/generative-reversible/blob/master/notebooks/celeba/Only_Clamp.ipynb)
 2. [Continue_Adversarial.ipynb](https://github.com/robintibor/generative-reversible/blob/master/notebooks/celeba/Continue_Adversarial.ipynb)
@@ -12,7 +13,7 @@ Running each for 250 epochs should definitely be enough to get similar results a
 [notebooks/celeba/Plot.ipynb](https://github.com/robintibor/generative-reversible/blob/master/notebooks/celeba/Plots.ipynb).
 
 Citing
-======
+------
 If you use this code in a scientific publication, please cite us as:
 
 .. code-block:: bibtex
@@ -30,5 +31,5 @@ If you use this code in a scientific publication, please cite us as:
 
 
 TODO
-======
+------
 Optimal Transport MNIST Code
