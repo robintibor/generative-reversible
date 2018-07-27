@@ -1,16 +1,16 @@
 Training Generative Reversible Networks
 =======================================
-This repository contains code accompanying the paper
-[Training Generative Reversible Networks](https://arxiv.org/abs/1806.01610).
+This repository contains code accompanying the paper `Training Generative Reversible Networks <https://arxiv.org/abs/1806.01610>`_.
 
 Run
 ------
-To reproduce the CelebA results, first run the notebooks under notebooks/celeba:
-1. [Only_Clamp.ipynb](https://github.com/robintibor/generative-reversible/blob/master/notebooks/celeba/Only_Clamp.ipynb)
-2. [Continue_Adversarial.ipynb](https://github.com/robintibor/generative-reversible/blob/master/notebooks/celeba/Continue_Adversarial.ipynb)
 
-Running each for 250 epochs should definitely be enough to get similar results as the ones in
-[notebooks/celeba/Plot.ipynb](https://github.com/robintibor/generative-reversible/blob/master/notebooks/celeba/Plots.ipynb).
+To reproduce the CelebA results, first run the notebooks under notebooks/celeba:
+
+1. `Only_Clamp.ipynb <https://github.com/robintibor/generative-reversible/blob/master/notebooks/celeba/Only_Clamp.ipynb>`_
+2. `Continue_Adversarial.ipynb <https://github.com/robintibor/generative-reversible/blob/master/notebooks/celeba/Continue_Adversarial.ipynb>`_
+
+Running each for 250 epochs should definitely be enough to get similar results as the ones in `notebooks/celeba/Plot.ipynb  <https://github.com/robintibor/generative-reversible/blob/master/notebooks/celeba/Plots.ipynb>`_.
 
 Citing
 ------
