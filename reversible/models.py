@@ -1,4 +1,5 @@
 import torch.nn as nn
+from torch.nn import ConstantPad2d
 from reversible.revnet import ReversibleBlockOld, SubsampleSplitter, ViewAs
 
 
@@ -39,4 +40,23 @@ def create_celebA_model():
         SubsampleSplitter(stride=2, checkerboard=True),  # 16
         rev_block(4096 * 3, 400, kernel_size=1),
         ViewAs((-1, 4096 * 3, 1, 1), (-1, 4096 * 3)), )
+    return feature_model
+
+
+def create_MNIST_model():
+    feature_model = nn.Sequential(
+        ConstantPad2d((2, 2, 2, 2), 0),
+        SubsampleSplitter(stride=2, checkerboard=True),
+        rev_block(4, 25),
+        rev_block(4, 25),
+        SubsampleSplitter(stride=2, checkerboard=True),
+        rev_block(16, 50),
+        rev_block(16, 50),
+        SubsampleSplitter(stride=2, checkerboard=True),
+        rev_block(64, 100),
+        rev_block(64, 100),
+        SubsampleSplitter(stride=2, checkerboard=True),
+        rev_block(256, 200),
+        rev_block(256, 200),
+        ViewAs((-1, 256, 2, 2), (-1, 256 * 2 * 2)), )
     return feature_model

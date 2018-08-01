@@ -483,14 +483,14 @@ def weights_init(module, conv_weight_init_fn):
                 'Linear' in classname)) and classname != "AvgPool2dWithConv":
         conv_weight_init_fn(module.weight)
         if module.bias is not None:
-            th.nn.init.constant(module.bias, 0)
+            th.nn.init.constant_(module.bias, 0)
     elif 'BatchNorm' in classname:
-        th.nn.init.constant(module.weight, 1)
-        th.nn.init.constant(module.bias, 0)
+        th.nn.init.constant_(module.weight, 1)
+        th.nn.init.constant_(module.bias, 0)
 
 
 def init_model_params(feature_model, gain):
     feature_model.apply(lambda module: weights_init(
         module,
-        lambda w: th.nn.init.xavier_uniform(w, gain=gain)))
+        lambda w: th.nn.init.xavier_uniform_(w, gain=gain)))
 
